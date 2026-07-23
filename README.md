@@ -33,24 +33,6 @@ signaling -> http://recording-bot:8090 -> WebRTC receive-only capture
 recording workers -> private API -> presigned S3 URLs
 ```
 
-## Локальный запуск
-
-Для полного локального сценария используйте корневой Compose основного
-репозитория. Он поднимает API, signaling, Redis, PostgreSQL, MinIO, capture bot
-и composition worker. Его настройки берутся из корневого `.env.example`.
-
-Отдельный `docker-compose.yml` этого репозитория нужен для topology media
-server. Он по умолчанию использует `recording-bot/.env.example` как локальный
-тестовый файл:
-
-```bash
-cd recording-bot
-docker compose --env-file .env.example up -d --build
-```
-
-Контейнеры не публикуют порт наружу. Внутри media Docker-сети signaling
-обращается к capture-боту по `http://recording-bot:8090`.
-
 ## Production
 
 Production-конфигурация передаётся через **GitLab CI/CD Variables**. Не

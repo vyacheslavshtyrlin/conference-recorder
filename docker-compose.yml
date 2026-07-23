@@ -7,15 +7,15 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - .env.example
+      - ${RECORDING_ENV_FILE:-.env.example}
     environment:
       NODE_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
+    ports:
+      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:8090:8090"
     volumes:
       - recording-capture-data:/var/lib/conference-recording
-    networks:
-      - conference-media
     shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-2.0}"
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
@@ -29,23 +29,16 @@ services:
       dockerfile: Dockerfile
     command: ["node", "dist/composition.js"]
     env_file:
-      - .env.example
+      - ${RECORDING_ENV_FILE:-.env.example}
     environment:
       NODE_ENV: production
     healthcheck:
       disable: true
     volumes:
       - recording-composition-data:/var/lib/conference-recording
-    networks:
-      - conference-media
     cpus: "${RECORDING_COMPOSITION_CPUS:-1.0}"
     mem_limit: "${RECORDING_COMPOSITION_MEMORY_LIMIT:-1g}"
     restart: unless-stopped
-
-networks:
-  conference-media:
-    external: true
-    name: "${RECORDING_MEDIA_NETWORK_NAME:-conference-media_default}"
 
 volumes:
   recording-capture-data:
