@@ -1,0 +1,22 @@
+﻿# Runtime configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+.npm-cache/
+coverage/
+
+# Local recording spool, artifacts and diagnostics
+recording-data/
+storage/
+tmp/
+*.webm
+*.mp4
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db

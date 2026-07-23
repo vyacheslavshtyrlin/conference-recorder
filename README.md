@@ -1,49 +1,130 @@
-﻿# Recording bot
+# Recording bot
 
-Сервис записи конференций. В одном репозитории и одном Docker-образе работают два независимых процесса:
+`recording-bot` — отдельный приватный сервис записи конференций. Он не является
+участником комнаты и не влияет на её жизненный цикл.
 
-- `recording-bot` — захватывает WebRTC-поток комнаты, режет его на WebM-сегменты и отправляет их через API в объектное хранилище;
-- `recording-composition` — получает очередь из API, скачивает сегменты по presigned URL, собирает и проверяет итоговый MP4, затем сообщает API о готовом артефакте.
+В одном репозитории и Docker-образе запускаются два разных контейнера:
 
-S3-ключей в контейнерах нет: ими владеет только API. Бот и composition worker используют разные service secrets для закрытых API-маршрутов.
+- `recording-bot` — receive-only WebRTC-клиент: получает потоки комнаты,
+  формирует WebM-сегменты и загружает их в S3 по короткоживущим URL от API;
+- `recording-composition` — забирает закрытую задачу композиции у API,
+  скачивает сегменты, собирает MP4 и сообщает API о результате.
 
-## Развёртывание
+Контейнеры не получают `DATABASE_URL`, S3 access key или S3 secret key. Эти
+данные принадлежат только API. Бот и composition worker используют независимые
+service secrets только для внутренних API-маршрутов.
 
-Recording-контур запускается на **media server**, рядом с `media/docker-compose.yml`. Он подключается к внешней Docker-сети `conference-media_default`, созданной media Compose. Поэтому сначала должен быть запущен media stack.
+## Что должно быть запущено
 
-API находится на app server. Его private URL указывается в `RECORDING_API_INTERNAL_URL`; API по private сети обращается к Redis на media server. Публичный WebSocket браузеров идёт отдельно: `wss://…/ws` → Nginx → signaling.
+Контур записи разворачивается на том же хосте, что и media/signaling. Перед его
+запуском должны быть доступны:
 
-Перед запуском заполните `.env.example` фактическими private URL и секретами либо передайте свой env-файл с теми же ключами. В production не используйте значения-заглушки из примера.
+1. media Compose и внешняя Docker-сеть `conference-media_default`;
+2. signaling, которому указан worker `http://recording-bot:8090` в
+   `RECORDING_BOT_WORKERS_JSON`;
+3. API по private-сети в `RECORDING_API_INTERNAL_URL`;
+4. Redis media server, доступный API по private-сети.
+
+Публичный трафик пользователей не проходит через recording-bot:
+
+```text
+browser -> wss://<public-host>/ws -> nginx -> signaling
+signaling -> http://recording-bot:8090 -> WebRTC receive-only capture
+recording workers -> private API -> presigned S3 URLs
+```
+
+## Локальный запуск
+
+Для полного локального сценария используйте корневой Compose основного
+репозитория. Он поднимает API, signaling, Redis, PostgreSQL, MinIO, capture bot
+и composition worker. Его настройки берутся из корневого `.env.example`.
+
+Отдельный `docker-compose.yml` этого репозитория нужен для topology media
+server. Он по умолчанию использует `recording-bot/.env.example` как локальный
+тестовый файл:
 
 ```bash
 cd recording-bot
 docker compose --env-file .env.example up -d --build
 ```
 
-Контейнеры не публикуют порты наружу. Signaling обращается к capture-боту внутри media Docker-сети по адресу `http://recording-bot:8090`.
+Контейнеры не публикуют порт наружу. Внутри media Docker-сети signaling
+обращается к capture-боту по `http://recording-bot:8090`.
 
-## Переменные окружения
+## Production
 
-Минимально необходимы:
+Production-конфигурация передаётся через **GitLab CI/CD Variables**. Не
+создавайте и не коммитьте production `.env`; `.env.example` содержит только
+локальные безопасные заглушки.
 
-```env
-RECORDING_API_INTERNAL_URL=http://<private-api-host>:3000
-RECORDING_CAPTURE_SERVICE_SECRET=<не менее 32 символов>
-RECORDING_COMPOSITION_SERVICE_SECRET=<не менее 32 символов>
-RECORDING_BOT_CONTROL_JWT_HS256_SECRET=<не менее 32 символов>
-RECORDING_MEDIA_NETWORK_NAME=conference-media_default
+Pipeline/deployment должен передать контейнерам как минимум:
+
+```text
+RECORDING_API_INTERNAL_URL
+RECORDING_CAPTURE_SERVICE_SECRET
+RECORDING_COMPOSITION_SERVICE_SECRET
+RECORDING_BOT_CONTROL_JWT_HS256_SECRET
+RECORDING_MEDIA_NETWORK_NAME
 ```
 
-`RECORDING_BOT_CONTROL_JWT_ISSUER`, `RECORDING_BOT_CONTROL_JWT_AUDIENCE` и TTL не задаются через env: это фиксированные значения внутреннего протокола (`conference-signaling`, `conference-recording-bot-control`, 300 секунд).
+Дополнительно обычно задаются лимиты ресурсов:
 
-Для signaling на media server должен быть задан один worker в `RECORDING_BOT_WORKERS_JSON` с адресом `http://recording-bot:8090`. API должен иметь E12-конфигурацию PostgreSQL, Yandex Object Storage и secrets capture/composition.
+```text
+RECORDING_BOT_CPUS
+RECORDING_BOT_MEMORY_LIMIT
+RECORDING_BOT_PIDS_LIMIT
+RECORDING_COMPOSITION_CPUS
+RECORDING_COMPOSITION_MEMORY_LIMIT
+```
 
-## Локальная разработка
+S3-переменные (`RECORDING_S3_*`), PostgreSQL и callback-настройки задаются
+только у API. В recording-bot их быть не должно.
 
-Полный локальный сценарий запускается root Compose из корня репозитория. Он использует корневой `.env.example`, поднимает API, signaling, Redis, PostgreSQL, MinIO, один capture-бот и composition worker.
+Фиксированные параметры внутреннего JWT не требуют env-переменных:
 
-Отдельный Compose этого каталога предназначен для topology media server и ожидает уже существующую внешнюю сеть media Compose.
+```text
+issuer:   conference-signaling
+audience: conference-recording-bot-control
+ttl:      300 seconds
+```
+
+## Переменные `.env.example`
+
+Файл предназначен только для local runtime. Перед локальной проверкой замените
+заглушки в своей рабочей копии на значения локального API и service secrets.
+В Git остаётся шаблон без секретов.
+
+| Переменная | Назначение |
+| --- | --- |
+| `RECORDING_API_INTERNAL_URL` | Private URL API, доступный из Docker-сети media server. |
+| `RECORDING_CAPTURE_SERVICE_SECRET` | Секрет capture worker для внутренних API записи. |
+| `RECORDING_COMPOSITION_SERVICE_SECRET` | Независимый секрет composition worker. |
+| `RECORDING_BOT_CONTROL_JWT_HS256_SECRET` | Секрет команд signaling → capture bot. |
+| `RECORDING_MEDIA_NETWORK_NAME` | Имя внешней Docker-сети, созданной media Compose. |
+| `RECORDING_BOT_MAX_SLOTS` | Одновременное число записываемых комнат на capture worker. |
+
+Один слот — одна одновременно записываемая комната. Увеличивать его можно
+только вместе с измеренным запасом CPU/RAM для Chromium и FFmpeg.
 
 ## Git
 
-`.env`, временные сегменты, локальные артефакты, зависимости и результаты сборки игнорируются в `recording-bot/.gitignore`. В Git добавляется только `.env.example` с безопасными значениями-заглушками. Не коммитьте S3 credentials, service secrets, готовые MP4/WebM и browser traces.
+Репозиторий самостоятельный:
+
+```bash
+git clone git@git.victory-crm.ru:conference/recording-bot.git
+cd recording-bot
+```
+
+Если папка уже содержит рабочий код, не выполняйте `git clone` поверх неё.
+Привяжите существующую ветку к remote:
+
+```bash
+git remote add origin git@git.victory-crm.ru:conference/recording-bot.git
+git push -u origin <branch-name>
+```
+
+Если `origin` уже существует, используйте `git remote set-url origin <url>`.
+
+`.gitignore` исключает `.env`, временные сегменты, MP4/WebM, browser traces,
+`node_modules` и `dist`. В Git добавляются исходный код, Docker-файлы и
+`.env.example` без реальных секретов.
