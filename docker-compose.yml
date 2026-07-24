@@ -1,7 +1,7 @@
 ﻿name: conference-recording
 
 services:
-  recording-bot:
+  recording-capture-1:
     init: true
     build:
       context: .
@@ -12,10 +12,109 @@ services:
       NODE_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
+      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
+      RECORDING_BOT_WORKER_ID: recording-worker-1
+      RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
     ports:
-      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:8090:8090"
+      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_1:-8091}:8090"
     volumes:
-      - recording-capture-data:/var/lib/conference-recording
+      - recording-capture-1-data:/var/lib/conference-recording
+    shm_size: 1gb
+    cpus: "${RECORDING_BOT_CPUS:-2.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    restart: unless-stopped
+
+  recording-capture-2:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${RECORDING_ENV_FILE:-.env.example}
+    environment:
+      NODE_ENV: production
+      RECORDING_BOT_BIND_HOST: 0.0.0.0
+      RECORDING_BOT_PORT: 8090
+      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
+      RECORDING_BOT_WORKER_ID: recording-worker-2
+      RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+    ports:
+      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_2:-8092}:8090"
+    volumes:
+      - recording-capture-2-data:/var/lib/conference-recording
+    shm_size: 1gb
+    cpus: "${RECORDING_BOT_CPUS:-2.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    restart: unless-stopped
+
+  recording-capture-3:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${RECORDING_ENV_FILE:-.env.example}
+    environment:
+      NODE_ENV: production
+      RECORDING_BOT_BIND_HOST: 0.0.0.0
+      RECORDING_BOT_PORT: 8090
+      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
+      RECORDING_BOT_WORKER_ID: recording-worker-3
+      RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+    ports:
+      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_3:-8093}:8090"
+    volumes:
+      - recording-capture-3-data:/var/lib/conference-recording
+    shm_size: 1gb
+    cpus: "${RECORDING_BOT_CPUS:-2.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    restart: unless-stopped
+
+  recording-capture-4:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${RECORDING_ENV_FILE:-.env.example}
+    environment:
+      NODE_ENV: production
+      RECORDING_BOT_BIND_HOST: 0.0.0.0
+      RECORDING_BOT_PORT: 8090
+      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
+      RECORDING_BOT_WORKER_ID: recording-worker-4
+      RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+    ports:
+      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_4:-8094}:8090"
+    volumes:
+      - recording-capture-4-data:/var/lib/conference-recording
+    shm_size: 1gb
+    cpus: "${RECORDING_BOT_CPUS:-2.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    restart: unless-stopped
+
+  recording-capture-5:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${RECORDING_ENV_FILE:-.env.example}
+    environment:
+      NODE_ENV: production
+      RECORDING_BOT_BIND_HOST: 0.0.0.0
+      RECORDING_BOT_PORT: 8090
+      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
+      RECORDING_BOT_WORKER_ID: recording-worker-5
+      RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+    ports:
+      - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_5:-8095}:8090"
+    volumes:
+      - recording-capture-5-data:/var/lib/conference-recording
     shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-2.0}"
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
@@ -41,5 +140,9 @@ services:
     restart: unless-stopped
 
 volumes:
-  recording-capture-data:
+  recording-capture-1-data:
+  recording-capture-2-data:
+  recording-capture-3-data:
+  recording-capture-4-data:
+  recording-capture-5-data:
   recording-composition-data:
