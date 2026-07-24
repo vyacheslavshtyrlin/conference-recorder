@@ -19,18 +19,18 @@ service secrets только для внутренних API-маршрутов.
 Контур записи разворачивается на том же хосте, что и media/signaling. Перед его
 запуском должны быть доступны:
 
-1. media Compose и внешняя Docker-сеть `conference-media_default`;
-2. signaling, которому указан worker `http://recording-bot:8090` в
+1. signaling, которому заданы пять capture worker-ов в
    `RECORDING_BOT_WORKERS_JSON`;
-3. API по private-сети в `RECORDING_API_INTERNAL_URL`;
-4. Redis media server, доступный API по private-сети.
+2. API в `RECORDING_API_INTERNAL_URL`;
+3. media и recording host, доступные друг другу по control URL worker-ов;
+4. Redis media server, доступный API.
 
 Публичный трафик пользователей не проходит через recording-bot:
 
 ```text
-browser -> wss://<public-host>/ws -> nginx -> signaling
-signaling -> http://recording-bot:8090 -> WebRTC receive-only capture
-recording workers -> private API -> presigned S3 URLs
+browser -> wss://media.victoryspace.ru/ws -> signaling
+signaling -> http://recorder.victoryspace.ru:8091..8095 -> capture workers
+capture/composition workers -> API -> presigned S3 URLs
 ```
 
 ## Production
@@ -46,7 +46,6 @@ RECORDING_API_INTERNAL_URL
 RECORDING_CAPTURE_SERVICE_SECRET
 RECORDING_COMPOSITION_SERVICE_SECRET
 RECORDING_BOT_CONTROL_JWT_HS256_SECRET
-RECORDING_MEDIA_NETWORK_NAME
 ```
 
 Дополнительно обычно задаются лимиты ресурсов:
@@ -58,6 +57,10 @@ RECORDING_BOT_PIDS_LIMIT
 RECORDING_COMPOSITION_CPUS
 RECORDING_COMPOSITION_MEMORY_LIMIT
 ```
+
+Текущий production preset: пять capture worker-ов по `6 CPU`, `8 GB` RAM и
+`512` PID каждый; composition worker — `2 CPU` и `4 GB` RAM. Суммарный CPU
+limit равен `32`.
 
 S3-переменные (`RECORDING_S3_*`), PostgreSQL и callback-настройки задаются
 только у API. В recording-bot их быть не должно.
@@ -78,15 +81,20 @@ ttl:      300 seconds
 
 | Переменная | Назначение |
 | --- | --- |
-| `RECORDING_API_INTERNAL_URL` | Private URL API, доступный из Docker-сети media server. |
+| `RECORDING_API_INTERNAL_URL` | URL API, доступный с recording host. |
 | `RECORDING_CAPTURE_SERVICE_SECRET` | Секрет capture worker для внутренних API записи. |
 | `RECORDING_COMPOSITION_SERVICE_SECRET` | Независимый секрет composition worker. |
 | `RECORDING_BOT_CONTROL_JWT_HS256_SECRET` | Секрет команд signaling → capture bot. |
-| `RECORDING_MEDIA_NETWORK_NAME` | Имя внешней Docker-сети, созданной media Compose. |
-| `RECORDING_BOT_MAX_SLOTS` | Одновременное число записываемых комнат на capture worker. |
+| `RECORDING_BOT_PUBLIC_ORIGIN` | Runtime URL Chromium внутри capture container; Compose фиксирует `http://127.0.0.1:8090`. |
+| `RECORDING_BOT_BIND_ADDR` | Host bind address для control-портов capture worker-ов. |
+| `RECORDING_CAPTURE_PORT_1` … `RECORDING_CAPTURE_PORT_5` | Control-порты пяти capture worker-ов (`8091` … `8095`). |
+| `RECORDING_BOT_MAX_SLOTS` | Одновременное число записываемых комнат на один capture worker. |
+| `RECORDING_BOT_CPUS` / `RECORDING_BOT_MEMORY_LIMIT` / `RECORDING_BOT_PIDS_LIMIT` | Лимиты каждого capture worker (`6.0` / `8g` / `512`). |
+| `RECORDING_COMPOSITION_CPUS` / `RECORDING_COMPOSITION_MEMORY_LIMIT` | Лимиты composition worker (`2.0` / `4g`). |
 
-Один слот — одна одновременно записываемая комната. Увеличивать его можно
-только вместе с измеренным запасом CPU/RAM для Chromium и FFmpeg.
+Один слот — одна одновременно записываемая комната. Production Compose запускает
+пять capture worker-ов с разными `RECORDING_BOT_WORKER_ID`; при
+`RECORDING_BOT_MAX_SLOTS=10` суммарная capacity равна 50 записям.
 
 ## Git
 

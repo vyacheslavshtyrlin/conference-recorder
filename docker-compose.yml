@@ -20,9 +20,9 @@ services:
     volumes:
       - recording-capture-1-data:/var/lib/conference-recording
     shm_size: 1gb
-    cpus: "${RECORDING_BOT_CPUS:-2.0}"
-    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
-    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
 
   recording-capture-2:
@@ -44,9 +44,9 @@ services:
     volumes:
       - recording-capture-2-data:/var/lib/conference-recording
     shm_size: 1gb
-    cpus: "${RECORDING_BOT_CPUS:-2.0}"
-    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
-    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
 
   recording-capture-3:
@@ -68,9 +68,9 @@ services:
     volumes:
       - recording-capture-3-data:/var/lib/conference-recording
     shm_size: 1gb
-    cpus: "${RECORDING_BOT_CPUS:-2.0}"
-    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
-    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
 
   recording-capture-4:
@@ -92,9 +92,9 @@ services:
     volumes:
       - recording-capture-4-data:/var/lib/conference-recording
     shm_size: 1gb
-    cpus: "${RECORDING_BOT_CPUS:-2.0}"
-    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
-    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
 
   recording-capture-5:
@@ -116,9 +116,9 @@ services:
     volumes:
       - recording-capture-5-data:/var/lib/conference-recording
     shm_size: 1gb
-    cpus: "${RECORDING_BOT_CPUS:-2.0}"
-    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-2g}"
-    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-256}"
+    cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
+    pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
 
   recording-composition:
@@ -135,8 +135,8 @@ services:
       disable: true
     volumes:
       - recording-composition-data:/var/lib/conference-recording
-    cpus: "${RECORDING_COMPOSITION_CPUS:-1.0}"
-    mem_limit: "${RECORDING_COMPOSITION_MEMORY_LIMIT:-1g}"
+    cpus: "${RECORDING_COMPOSITION_CPUS:-2.0}"
+    mem_limit: "${RECORDING_COMPOSITION_MEMORY_LIMIT:-4g}"
     restart: unless-stopped
 
 volumes:
