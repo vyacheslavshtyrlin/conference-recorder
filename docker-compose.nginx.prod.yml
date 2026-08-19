@@ -1,0 +1,106 @@
+x-logging: &default-logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+services:
+  cert-bootstrap:
+    image: alpine:3.20
+    restart: "no"
+    environment:
+      DOMAIN: recorder.victoryspace.ru
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        D=$$DOMAIN
+        LIVE=/etc/letsencrypt/live/$$D
+        if [ -s "$$LIVE/fullchain.pem" ] && [ -s "$$LIVE/privkey.pem" ]; then
+          echo "[cert-bootstrap] сертификат уже есть, пропускаю"; exit 0
+        fi
+        echo "[cert-bootstrap] генерирую placeholder-сертификат для $$D"
+        mkdir -p "$$LIVE"
+        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+          -subj "/CN=$$D" \
+          -keyout "$$LIVE/privkey.pem" -out "$$LIVE/fullchain.pem"
+    <<: *default-logging
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: recorder-nginx
+    restart: unless-stopped
+    depends_on:
+      cert-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - certbot_conf:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    networks:
+      - recording-network
+    <<: *default-logging
+
+  certbot:
+    build:
+      context: ./nginx
+      dockerfile: certbot-reloader.Dockerfile
+    image: conference-recorder-certbot:latest
+    restart: unless-stopped
+    depends_on:
+      nginx:
+        condition: service_started
+    environment:
+      DOMAIN: recorder.victoryspace.ru
+      EMAIL: ${LETSENCRYPT_EMAIL:?укажите LETSENCRYPT_EMAIL}
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        D=$$DOMAIN; E=$$EMAIL
+        RELOAD="docker kill -s HUP recorder-nginx 2>/dev/null || true"
+        RENEWAL=/etc/letsencrypt/renewal/$$D.conf
+
+        issue() {
+          # Чистим placeholder-линию, чтобы certbot создал настоящую.
+          rm -rf "/etc/letsencrypt/live/$$D" "/etc/letsencrypt/archive/$$D" "$$RENEWAL"
+          certbot certonly --webroot -w /var/www/certbot -d "$$D" -m "$$E" \
+            --agree-tos --non-interactive
+        }
+
+        if [ ! -f "$$RENEWAL" ]; then
+          issue && eval "$$RELOAD" || echo "[certbot] первичный выпуск не удался, повторю в цикле"
+        fi
+
+        while :; do
+          sleep 12h
+          if [ ! -f "$$RENEWAL" ]; then
+            issue && eval "$$RELOAD" || true
+          else
+            certbot renew --webroot -w /var/www/certbot --deploy-hook "$$RELOAD" || true
+          fi
+        done
+    <<: *default-logging
+
+networks:
+  # Default-сеть проекта conference-recording: там живут recording-capture-1..5.
+  recording-network:
+    external: true
+    name: conference-recording_default
+
+volumes:
+  certbot_conf:
+    name: recorder_certbot_conf
+  certbot_www:
+    name: recorder_certbot_www

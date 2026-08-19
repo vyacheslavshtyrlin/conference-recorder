@@ -3,6 +3,7 @@
 services:
   recording-capture-1:
     init: true
+    image: ${RECORDING_IMAGE:-conference-recording-bot:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -27,6 +28,7 @@ services:
 
   recording-capture-2:
     init: true
+    image: ${RECORDING_IMAGE:-conference-recording-bot:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -51,6 +53,7 @@ services:
 
   recording-capture-3:
     init: true
+    image: ${RECORDING_IMAGE:-conference-recording-bot:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -75,6 +78,7 @@ services:
 
   recording-capture-4:
     init: true
+    image: ${RECORDING_IMAGE:-conference-recording-bot:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -99,6 +103,7 @@ services:
 
   recording-capture-5:
     init: true
+    image: ${RECORDING_IMAGE:-conference-recording-bot:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -123,6 +128,7 @@ services:
 
   recording-composition:
     init: true
+    image: ${RECORDING_IMAGE:-conference-recording-bot:local}
     build:
       context: .
       dockerfile: Dockerfile

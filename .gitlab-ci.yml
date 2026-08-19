@@ -1,0 +1,79 @@
+stages:
+  - validate
+  - build
+  - deploy
+  - cleanup
+  - setup-nginx
+
+variables:
+  DEPLOY_BRANCH: "main"
+  IMAGE_ENV_VAR: "RECORDING_IMAGE"
+  IMAGE_NAME: "conference-recording-bot"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+default:
+  tags:
+    - 176.109.111.184
+
+validate:
+  stage: validate
+  before_script:
+    - npm ci
+  script:
+    - npm run lint
+    - npm run typecheck
+    - npm run test
+    - npm run build
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+build:
+  stage: build
+  script:
+    - docker build -f Dockerfile -t "${IMAGE_NAME}:latest" .
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
+
+deploy:
+  stage: deploy
+  environment:
+    name: prod
+  script:
+    - |
+      if [ -n "$DEPLOY_ENV_PROD" ] && [ -f "$DEPLOY_ENV_PROD" ]; then
+        export RECORDING_ENV_FILE="$DEPLOY_ENV_PROD"
+      fi
+    - export ${IMAGE_ENV_VAR}="${IMAGE_NAME}:latest"
+    - docker compose -f docker-compose.yml up -d --no-build --remove-orphans
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
+
+cleanup:
+  stage: cleanup
+  script:
+    - docker container prune --force --filter "until=24h"
+    - docker image prune --force --filter "until=24h"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
+      when: always
+
+setup-nginx-prod:
+  stage: setup-nginx
+  tags:
+    - 176.109.111.184
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: true
+  needs: []
+  script:
+    - test -n "$LETSENCRYPT_EMAIL" || { echo "Задайте CI/CD-переменную LETSENCRYPT_EMAIL"; exit 1; }
+    - docker network create conference-recording_default 2>/dev/null || true
+    - docker compose -f docker-compose.nginx.prod.yml build certbot
+    - docker compose -f docker-compose.nginx.prod.yml up -d --force-recreate
+    - docker image prune -f

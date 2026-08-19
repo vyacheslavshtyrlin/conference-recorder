@@ -29,9 +29,33 @@ service secrets только для внутренних API-маршрутов.
 
 ```text
 browser -> wss://media.victoryspace.ru/ws -> signaling
-signaling -> http://recorder.victoryspace.ru:8091..8095 -> capture workers
+signaling -> https://recorder.victoryspace.ru/workers/1..5 (nginx, TLS) -> capture workers
 capture/composition workers -> API -> presigned S3 URLs
 ```
+
+## Nginx (TLS-терминация)
+
+`docker-compose.nginx.prod.yml` — edge-оверлей по образцу
+`victory-fabric-front`: `cert-bootstrap` (self-signed placeholder) → `nginx`
+(:80/:443, редирект на HTTPS) → `certbot` (Let's Encrypt webroot, продление
+каждые 12ч, SIGHUP reload nginx через docker.sock).
+
+Маршрутизация: `https://recorder.victoryspace.ru/workers/N/...` →
+`recording-capture-N:8090/...` (префикс `/workers/N` срезается). Воркеры stateful
+и обнесены fence-заголовками, поэтому round-robin запрещён — путь жёстко
+закреплён за своим воркером. `controlUrl` в `RECORDING_BOT_WORKERS_JSON` у
+signaling = `https://recorder.victoryspace.ru/workers/N`.
+
+Запуск (нужны поднятый базовый стек `conference-recording` — nginx подключается
+к его внешней сети `conference-recording_default` — A-запись
+`recorder.victoryspace.ru` на этот хост и `LETSENCRYPT_EMAIL` в `.env`):
+
+```bash
+docker compose -f docker-compose.nginx.prod.yml up -d --build
+```
+
+Прямые host-порты `8091..8095` (`RECORDING_BOT_BIND_ADDR=127.0.0.1`) остаются
+как debug/fallback-доступ к воркерам в обход nginx.
 
 ## Production
 
@@ -91,6 +115,7 @@ ttl:      300 seconds
 | `RECORDING_BOT_MAX_SLOTS` | Одновременное число записываемых комнат на один capture worker. |
 | `RECORDING_BOT_CPUS` / `RECORDING_BOT_MEMORY_LIMIT` / `RECORDING_BOT_PIDS_LIMIT` | Лимиты каждого capture worker (`6.0` / `8g` / `512`). |
 | `RECORDING_COMPOSITION_CPUS` / `RECORDING_COMPOSITION_MEMORY_LIMIT` | Лимиты composition worker (`2.0` / `4g`). |
+| `LETSENCRYPT_EMAIL` | Email для сертификата Let's Encrypt домена `recorder.victoryspace.ru` (`docker-compose.nginx.prod.yml`). |
 
 Один слот — одна одновременно записываемая комната. Production Compose запускает
 пять capture worker-ов с разными `RECORDING_BOT_WORKER_ID`; при
