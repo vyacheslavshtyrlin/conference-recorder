@@ -1,0 +1,25 @@
+{
+  "id": "consumer-opus",
+  "producerId": "mic-1",
+  "kind": "audio",
+  "rtpParameters": {
+    "mid": "0",
+    "codecs": [
+      {
+        "mimeType": "audio/opus",
+        "payloadType": 100,
+        "clockRate": 48000,
+        "channels": 2,
+        "parameters": { "useinbandfec": 1, "minptime": 10 },
+        "rtcpFeedback": [ { "type": "transport-cc", "parameter": "" } ]
+      }
+    ],
+    "headerExtensions": [
+      { "uri": "urn:ietf:params:rtp-hdrext:sdes:mid", "id": 1, "encrypt": false, "parameters": {} },
+      { "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01", "id": 5, "encrypt": false, "parameters": {} }
+    ],
+    "encodings": [ { "ssrc": 11111111 } ],
+    "rtcp": { "cname": "mediasoup-opus", "reducedSize": true }
+  },
+  "paused": true
+}

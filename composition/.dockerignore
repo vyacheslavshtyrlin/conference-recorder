@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+.npm-cache
+.vitest
+.git
+.gitignore
+npm-debug.log*
+go.mod
+*.log
+*.tmp
+.DS_Store

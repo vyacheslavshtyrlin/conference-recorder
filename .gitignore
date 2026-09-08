@@ -1,11 +1,16 @@
-﻿# Runtime configuration and secrets
+# Runtime configuration and secrets
 .env
 .env.*
 !.env.example
 
 # Dependencies and build output
+.gocache/
+/capture
+/capture.exe
 node_modules/
 dist/
+composition/dist/
+composition/coverage/
 .npm-cache/
 coverage/
 
@@ -16,6 +21,7 @@ tmp/
 *.webm
 *.mp4
 *.log
+*.tmp
 
 # OS/editor files
 .DS_Store

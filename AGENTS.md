@@ -8,31 +8,35 @@ Required reading:
 - `../AGENTS.md`
 - `../docs/architecture.md`
 - `../docs/contracts.md`
-- `../docs/epics/E11-recording-bot-and-storage-boundary.md`
 - `../docs/epics/E12-s3-recording-delivery-control-plane.md`
+- `../docs/epics/E13-go-track-capture-and-server-composition.md`
 
-Required skill: `docker-expert` for container, volume, resource-limit or runtime changes.
+Required skills:
+
+- `golang-code-style` for Go implementation and review.
+- `docker-expert` for container, volume, resource-limit or runtime changes.
 
 Ownership:
 
-- Owns private recording-bot control/runtime code, Chromium supervision, FFmpeg finalization, technical manifests and recording storage adapters.
-- Does not own public recording controls, human participant state, mediasoup room liveness or durable integration metadata.
-- E11-T7 is a behavior-preserving structural refactoring gate, E11-T8 adds
-  segmented recovery and E11-T9 adds the capacity-controlled worker pool.
-  E11-T10 is decided: E12-T3 owns the remote segment adapter while API owns
-  durable metadata, callbacks, retention and download authority.
+- Owns the Go/Pion receive-only capture worker, its private spool and direct
+  presigned uploads.
+- Owns the independent Node.js composition worker under `composition/**`.
+- Does not own public recording controls, human participant state, mediasoup
+  room liveness or durable integration metadata.
 
 Rules:
 
-- The bot is receive-only and must never appear as a human participant or keep a room live.
+- The bot is receive-only and must never appear as a human participant or keep
+  a room live.
 - Partial, gapped or failed uploads must never publish a ready artifact.
-- Bound browser processes, recording slots, source bytes, duration, FFmpeg runtime and shutdown.
+- Bound recording slots, source bytes, duration, FFmpeg runtime and shutdown.
 - Keep local files, manifests, admissions and storage credentials private.
-- Publish local artifacts atomically only after stream verification.
+- Workers never receive PostgreSQL or permanent S3 credentials.
 
 Verification before handoff:
 
-- `npm run typecheck`
-- `npm run lint`
-- `npm test`
-- `docker compose config --quiet` and a root Compose build when runtime packaging changes
+- `go test ./...`
+- `go vet ./...`
+- composition typecheck, lint and tests
+- root and scoped `docker compose config --quiet`
+- root Compose builds for `recording-bot` and `recording-composition`

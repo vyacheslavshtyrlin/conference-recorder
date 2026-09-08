@@ -1,0 +1,402 @@
+package signaling
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+var ErrAuthoritativeStop = errors.New("authoritative recording stop")
+
+// PeerSession is the receive-only WebRTC lifecycle controlled by signaling.
+type PeerSession interface {
+	ReconcileConsumers(
+		ctx context.Context,
+		transport TransportOptions,
+		consumers []Consumer,
+	) (string, DTLSParameters, error)
+	RequestKeyFrame(ctx context.Context, ssrc uint32) error
+	Close() error
+}
+
+// ProbeController binds ordered v1 lifecycle events to server consumers and a
+// dynamically renegotiated Pion receive session.
+type ProbeController struct {
+	signaling         SignalingClient
+	peer              PeerSession
+	transport         TransportOptions
+	rtpCapabilities   json.RawMessage
+	reconciler        *Reconciler
+	consumers         map[string]Consumer
+	consumerOrder     []string
+	connected         bool
+	mu                sync.Mutex
+	terminal          bool
+	authoritativeStop bool
+	observer          LifecycleObserver
+}
+
+type LifecycleObserver interface {
+	Snapshot(context.Context, Snapshot) error
+	Event(context.Context, Event) error
+}
+
+// StartProbe establishes the authoritative snapshot and initial consumers.
+func StartProbe(
+	ctx context.Context,
+	signaling SignalingClient,
+	peer PeerSession,
+) (*ProbeController, error) {
+	return StartProbeWithObserver(ctx, signaling, peer, nil)
+}
+
+func StartProbeWithObserver(
+	ctx context.Context,
+	signaling SignalingClient,
+	peer PeerSession,
+	observer LifecycleObserver,
+) (*ProbeController, error) {
+	rtpCapabilities, err := signaling.RouterRTPCapabilities(ctx)
+	if err != nil {
+		return nil, failStart(signaling, peer, fmt.Errorf("get router RTP capabilities: %w", err))
+	}
+	if !json.Valid(rtpCapabilities) {
+		return nil, failStart(signaling, peer, errors.New("router RTP capabilities are invalid JSON"))
+	}
+	transport, err := signaling.CreateRecvTransport(ctx)
+	if err != nil {
+		return nil, failStart(signaling, peer, fmt.Errorf("create receive transport: %w", err))
+	}
+	snapshot, err := signaling.SyncSnapshot(ctx)
+	if err != nil {
+		return nil, failStart(signaling, peer, fmt.Errorf("sync producer snapshot: %w", err))
+	}
+	reconciler, err := NewReconciler(snapshot)
+	if err != nil {
+		return nil, failStart(signaling, peer, fmt.Errorf("validate producer snapshot: %w", err))
+	}
+
+	controller := &ProbeController{
+		signaling:       signaling,
+		peer:            peer,
+		transport:       transport,
+		rtpCapabilities: rtpCapabilities,
+		reconciler:      reconciler,
+		consumers:       map[string]Consumer{},
+		consumerOrder:   []string{},
+		observer:        observer,
+	}
+	if observer != nil {
+		if err := observer.Snapshot(ctx, snapshot); err != nil {
+			return nil, controller.fail(fmt.Errorf("checkpoint producer snapshot: %w", err))
+		}
+	}
+	for _, producer := range snapshot.Producers {
+		if producer.Paused {
+			continue
+		}
+		if err := controller.ensureAndResume(ctx, producer); err != nil {
+			return nil, controller.fail(err)
+		}
+	}
+	return controller, nil
+}
+
+// Reconciler returns the controller's authoritative in-memory state.
+func (controller *ProbeController) Reconciler() *Reconciler {
+	return controller.reconciler
+}
+
+// WhileActive runs action only while lifecycle termination has not begun.
+// It shares the terminal-state lock with Run so readiness cannot overtake a
+// stop or failure that the controller has already accepted.
+func (controller *ProbeController) WhileActive(ctx context.Context, action func()) bool {
+	if ctx == nil || action == nil {
+		return false
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if ctx.Err() != nil || controller.terminal || controller.authoritativeStop {
+		return false
+	}
+	action()
+	return true
+}
+
+// Run applies lifecycle events until context cancellation or signaling close.
+func (controller *ProbeController) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return controller.fail(ctx.Err())
+		case event, open := <-controller.signaling.Lifecycle():
+			if !open {
+				return controller.fail(errors.New("private signaling lifecycle closed"))
+			}
+			if event.Type == "bot:stop" {
+				controller.mu.Lock()
+				controller.authoritativeStop = true
+				controller.mu.Unlock()
+				return ErrAuthoritativeStop
+			}
+			if err := controller.Apply(ctx, event); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// Apply reconciles one ordered event and performs its consumer-side mutation.
+func (controller *ProbeController) Apply(ctx context.Context, event Event) error {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.terminal {
+		return errors.New("probe controller is terminal")
+	}
+	prior, hadPrior := Producer{}, false
+	if event.Type == "bot:producerUpdated" && event.Producer != nil {
+		prior, hadPrior = controller.producer(event.Producer.ProducerID)
+	}
+	applied, err := controller.reconciler.Apply(event)
+	if err != nil {
+		return controller.failLocked(err)
+	}
+	if !applied {
+		return nil
+	}
+	if controller.observer != nil {
+		if err := controller.observer.Event(ctx, event); err != nil {
+			return controller.failLocked(fmt.Errorf("checkpoint lifecycle event: %w", err))
+		}
+	}
+
+	switch event.Type {
+	case "bot:producerAdded", "bot:producerUpdated":
+		if event.Type == "bot:producerUpdated" && hadPrior &&
+			producerIdentityChanged(prior, *event.Producer) {
+			if err := controller.closeConsumer(ctx, event.Producer.ProducerID); err != nil {
+				return err
+			}
+		}
+		if event.Producer.Paused {
+			return controller.pause(ctx, event.Producer.ProducerID)
+		}
+		return controller.ensureAndResume(ctx, *event.Producer)
+	case "bot:producerPaused":
+		return controller.pause(ctx, event.ProducerID)
+	case "bot:producerResumed":
+		producer, exists := controller.producer(event.ProducerID)
+		if !exists {
+			return controller.failLocked(errors.New("resumed producer is missing"))
+		}
+		return controller.ensureAndResume(ctx, producer)
+	case "bot:producerClosed":
+		return controller.closeConsumer(ctx, event.ProducerID)
+	case "bot:participantAdded", "bot:participantUpdated", "bot:participantLeft":
+		return nil
+	default:
+		return controller.failLocked(fmt.Errorf("unsupported lifecycle event %q", event.Type))
+	}
+}
+
+// Close rolls back every server consumer and releases the Pion/signaling peers.
+func (controller *ProbeController) Close() error {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.failLocked(nil)
+}
+
+func (controller *ProbeController) ensureAndResume(
+	ctx context.Context,
+	producer Producer,
+) error {
+	consumer, exists := controller.consumers[producer.ProducerID]
+	if !exists {
+		created, err := controller.signaling.Consume(
+			ctx,
+			controller.transport.ID,
+			producer.ProducerID,
+			controller.rtpCapabilities,
+		)
+		if err != nil {
+			return controller.failLocked(fmt.Errorf("consume producer: %w", err))
+		}
+		created.Source = producer.Source
+		if err := validateConsumer(producer, created); err != nil {
+			_ = controller.signaling.CloseConsumer(ctx, producer.ProducerID)
+			return controller.failLocked(err)
+		}
+		controller.consumers[producer.ProducerID] = created
+		controller.consumerOrder = append(controller.consumerOrder, producer.ProducerID)
+		consumer = created
+		if err := controller.renegotiate(ctx); err != nil {
+			_ = controller.signaling.CloseConsumer(ctx, producer.ProducerID)
+			controller.removeConsumerLocked(producer.ProducerID)
+			return controller.failLocked(err)
+		}
+	}
+	if err := controller.signaling.ResumeConsumer(ctx, producer.ProducerID); err != nil {
+		return controller.failLocked(fmt.Errorf("resume consumer: %w", err))
+	}
+	if producer.Kind == KindVideo {
+		ssrc := consumer.RTPParameters.Encodings[0].SSRC
+		if err := controller.peer.RequestKeyFrame(ctx, ssrc); err != nil {
+			return controller.failLocked(fmt.Errorf("request key frame: %w", err))
+		}
+	}
+	return nil
+}
+
+func (controller *ProbeController) pause(ctx context.Context, producerID string) error {
+	if _, exists := controller.consumers[producerID]; !exists {
+		return nil
+	}
+	if err := controller.signaling.PauseConsumer(ctx, producerID); err != nil {
+		return controller.failLocked(fmt.Errorf("pause consumer: %w", err))
+	}
+	return nil
+}
+
+func (controller *ProbeController) closeConsumer(
+	ctx context.Context,
+	producerID string,
+) error {
+	if _, exists := controller.consumers[producerID]; !exists {
+		return nil
+	}
+	if err := controller.signaling.CloseConsumer(ctx, producerID); err != nil {
+		return controller.failLocked(fmt.Errorf("close consumer: %w", err))
+	}
+	controller.removeConsumerLocked(producerID)
+	if err := controller.renegotiate(ctx); err != nil {
+		return controller.failLocked(err)
+	}
+	return nil
+}
+
+func (controller *ProbeController) removeConsumerLocked(producerID string) {
+	delete(controller.consumers, producerID)
+	kept := controller.consumerOrder[:0]
+	for _, current := range controller.consumerOrder {
+		if current != producerID {
+			kept = append(kept, current)
+		}
+	}
+	controller.consumerOrder = kept
+}
+
+func (controller *ProbeController) renegotiate(ctx context.Context) error {
+	_, dtlsParameters, err := controller.peer.ReconcileConsumers(
+		ctx,
+		controller.transport,
+		controller.orderedConsumers(),
+	)
+	if err != nil {
+		return fmt.Errorf("negotiate Pion receive transport: %w", err)
+	}
+	if controller.connected {
+		return nil
+	}
+	if err := controller.signaling.ConnectRecvTransport(
+		ctx,
+		controller.transport.ID,
+		dtlsParameters,
+	); err != nil {
+		return fmt.Errorf("connect receive transport: %w", err)
+	}
+	controller.connected = true
+	return nil
+}
+
+func (controller *ProbeController) orderedConsumers() []Consumer {
+	result := make([]Consumer, 0, len(controller.consumers))
+	for _, producerID := range controller.consumerOrder {
+		consumer, exists := controller.consumers[producerID]
+		if exists {
+			result = append(result, consumer)
+		}
+	}
+	return result
+}
+
+func (controller *ProbeController) producer(producerID string) (Producer, bool) {
+	for _, producer := range controller.reconciler.Producers() {
+		if producer.ProducerID == producerID {
+			return producer, true
+		}
+	}
+	return Producer{}, false
+}
+
+func (controller *ProbeController) fail(cause error) error {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.failLocked(cause)
+}
+
+func (controller *ProbeController) failLocked(cause error) error {
+	if controller.terminal {
+		return cause
+	}
+	controller.terminal = true
+	cleanupContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errorsFound := []error{}
+	if cause != nil {
+		errorsFound = append(errorsFound, cause)
+	}
+	for producerID := range controller.consumers {
+		if err := controller.signaling.CloseConsumer(cleanupContext, producerID); err != nil {
+			if !controller.authoritativeStop {
+				errorsFound = append(errorsFound, fmt.Errorf("rollback consumer: %w", err))
+			}
+		}
+	}
+	if err := controller.peer.Close(); err != nil {
+		errorsFound = append(errorsFound, fmt.Errorf("close Pion peer: %w", err))
+	}
+	if err := controller.signaling.Close(); err != nil {
+		errorsFound = append(errorsFound, fmt.Errorf("close signaling: %w", err))
+	}
+	return errors.Join(errorsFound...)
+}
+
+func producerIdentityChanged(previous, next Producer) bool {
+	return previous.ParticipantID != next.ParticipantID ||
+		previous.Source != next.Source ||
+		previous.Kind != next.Kind
+}
+
+func failStart(signaling SignalingClient, peer PeerSession, cause error) error {
+	errorsFound := []error{cause}
+	if err := peer.Close(); err != nil {
+		errorsFound = append(errorsFound, err)
+	}
+	if err := signaling.Close(); err != nil {
+		errorsFound = append(errorsFound, err)
+	}
+	return errors.Join(errorsFound...)
+}
+
+func validateConsumer(producer Producer, consumer Consumer) error {
+	if consumer.ProducerID != producer.ProducerID {
+		return errors.New("consumer producerId does not match requested producer")
+	}
+	if consumer.Kind != producer.Kind {
+		return errors.New("consumer kind does not match producer")
+	}
+	primary, err := primaryCodec(consumer.RTPParameters.Codecs)
+	if err != nil {
+		return err
+	}
+	if len(consumer.RTPParameters.Encodings) != 1 {
+		return errors.New("consumer must have exactly one RTP encoding")
+	}
+	if consumer.RTPParameters.MID == "" {
+		return errors.New("consumer stable MID is required")
+	}
+	return ValidateCodec(producer.Kind, producer.Source, primary.MimeType)
+}
