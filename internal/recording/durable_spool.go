@@ -19,6 +19,7 @@ import (
 
 type SpoolManifest struct {
 	Version                  int                `json:"version"`
+	AttemptID                string             `json:"attemptId"`
 	RecordingID              string             `json:"recordingId"`
 	WorkerID                 string             `json:"workerId"`
 	WorkerGenerationID       string             `json:"workerGenerationId"`
@@ -32,6 +33,14 @@ type SpoolManifest struct {
 	LastCheckpointTimelineMS int64              `json:"lastCheckpointTimelineMs"`
 	Records                  []CheckpointRecord `json:"records"`
 	Segments                 []DurableSegment   `json:"segments"`
+}
+
+type SpoolMutationFence struct {
+	AttemptID          string
+	RecordingID        string
+	WorkerID           string
+	WorkerGenerationID string
+	CaptureGeneration  int32
 }
 
 type DurableSpool struct {
@@ -90,7 +99,7 @@ func (spool *DurableSpool) Begin(
 	}
 	if manifest == nil {
 		manifest = &SpoolManifest{
-			Version: 1, RecordingID: fence.RecordingID, WorkerID: fence.WorkerID,
+			Version: 1, AttemptID: fence.AttemptID, RecordingID: fence.RecordingID, WorkerID: fence.WorkerID,
 			WorkerGenerationID: fence.WorkerGenerationID, CaptureGeneration: captureGeneration,
 			CaptureStartedAt: captureStartedAt, BindingMode: bindingMode, Status: "capturing",
 			LastCheckpointSequence: -1, Records: []CheckpointRecord{}, Segments: []DurableSegment{},
@@ -102,12 +111,23 @@ func (spool *DurableSpool) Begin(
 		if manifest.CaptureGeneration > captureGeneration {
 			return nil, ErrAttemptFenceMismatch
 		}
+		if manifest.CaptureGeneration == captureGeneration {
+			exactOwner := manifest.AttemptID == fence.AttemptID &&
+				manifest.WorkerID == fence.WorkerID &&
+				manifest.WorkerGenerationID == fence.WorkerGenerationID &&
+				manifest.BindingMode == bindingMode
+			if !exactOwner {
+				return nil, ErrAttemptFenceMismatch
+			}
+		}
 		if manifest.CaptureGeneration < captureGeneration {
 			manifest.Segments = []DurableSegment{}
 			manifest.SourceBytes = 0
 			manifest.LastCheckpointSequence = -1
 			manifest.LastCheckpointHash = ""
+			delete(spool.staging, fence.RecordingID)
 		}
+		manifest.AttemptID = fence.AttemptID
 		manifest.WorkerID = fence.WorkerID
 		manifest.WorkerGenerationID = fence.WorkerGenerationID
 		manifest.CaptureGeneration = captureGeneration
@@ -132,7 +152,7 @@ func (spool *DurableSpool) Begin(
 
 func (spool *DurableSpool) StoreSegment(
 	ctx context.Context,
-	recordingID string,
+	fence SpoolMutationFence,
 	descriptor SegmentDescriptor,
 	stagingPath string,
 ) (DurableSegment, error) {
@@ -144,8 +164,12 @@ func (spool *DurableSpool) StoreSegment(
 	}
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return DurableSegment{}, err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return DurableSegment{}, err
 	}
 	if err := spool.verifyRecordingDirectoriesLocked(recordingID, true); err != nil {
@@ -244,14 +268,18 @@ func manifestContainsSegment(manifest *SpoolManifest, wanted DurableSegment) boo
 	return false
 }
 
-func (spool *DurableSpool) ResizeStaging(recordingID, path string, size int64) error {
+func (spool *DurableSpool) ResizeStaging(fence SpoolMutationFence, path string, size int64) error {
 	if size < 0 || path == "" {
 		return errors.New("invalid staging reservation")
 	}
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	if err := spool.verifyRecordingDirectoriesLocked(recordingID, true); err != nil {
@@ -280,10 +308,14 @@ func (spool *DurableSpool) ResizeStaging(recordingID, path string, size int64) e
 	return nil
 }
 
-func (spool *DurableSpool) ReleaseStaging(recordingID, path string) {
+func (spool *DurableSpool) ReleaseStaging(fence SpoolMutationFence, path string) {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
-	delete(spool.staging[recordingID], filepath.Clean(path))
+	manifest, err := spool.requireLocked(fence.RecordingID)
+	if err != nil || requireSpoolFence(manifest, fence) != nil {
+		return
+	}
+	delete(spool.staging[fence.RecordingID], filepath.Clean(path))
 }
 
 func (spool *DurableSpool) stagingBytesLocked(recordingID string) int64 {
@@ -294,10 +326,15 @@ func (spool *DurableSpool) stagingBytesLocked(recordingID string) int64 {
 	return total
 }
 
-func (spool *DurableSpool) CleanupStaging(recordingID string) error {
+func (spool *DurableSpool) CleanupStaging(fence SpoolMutationFence) error {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
-	if err := spool.prepareRecordingLocked(recordingID); err != nil {
+	recordingID := fence.RecordingID
+	manifest, err := spool.requireLocked(recordingID)
+	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	if len(spool.staging[recordingID]) != 0 {
@@ -319,22 +356,25 @@ func (spool *DurableSpool) CleanupStaging(recordingID string) error {
 }
 
 func (spool *DurableSpool) MarkCommitted(
-	recordingID string,
-	captureGeneration int32,
+	fence SpoolMutationFence,
 	trackID string,
 	sequence int32,
 	uploadID string,
 ) error {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	candidate := cloneManifest(manifest)
 	for index := range candidate.Segments {
 		segment := &candidate.Segments[index]
-		if segment.CaptureGeneration == captureGeneration && segment.TrackID == trackID && segment.Sequence == sequence {
+		if segment.CaptureGeneration == fence.CaptureGeneration && segment.TrackID == trackID && segment.Sequence == sequence {
 			if segment.Committed && segment.UploadID != uploadID {
 				return errors.New("durable upload identity conflict")
 			}
@@ -352,14 +392,18 @@ func (spool *DurableSpool) MarkCommitted(
 }
 
 func (spool *DurableSpool) StoreCheckpoint(
-	recordingID string,
+	fence SpoolMutationFence,
 	checkpoint GenerationCheckpoint,
 	records []CheckpointRecord,
 ) error {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	if checkpoint.CaptureGeneration != manifest.CaptureGeneration ||
@@ -388,14 +432,18 @@ func (spool *DurableSpool) StoreCheckpoint(
 // checkpoint after recovery. The API may have committed a checkpoint whose
 // subsequent local manifest persist was interrupted by a process crash.
 func (spool *DurableSpool) ReconcileCheckpoint(
-	recordingID string,
+	fence SpoolMutationFence,
 	checkpoint GenerationCheckpoint,
 	records []CheckpointRecord,
 ) error {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	if checkpoint.CaptureGeneration != manifest.CaptureGeneration ||
@@ -472,7 +520,7 @@ func (spool *DurableSpool) RecoveryHealth() ([]string, []string, error) {
 	recoverable := []string{}
 	finalizations := []string{}
 	for recordingID, manifest := range spool.manifests {
-		if manifest.Status == "sealed" {
+		if manifest.Status == "sealed" || manifest.Status == "failed" {
 			info, statErr := os.Stat(spool.manifestPath(recordingID))
 			if statErr == nil && time.Since(info.ModTime()) >= sealedSpoolRetention {
 				if os.RemoveAll(spool.recordingDir(recordingID)) == nil {
@@ -495,11 +543,15 @@ func (spool *DurableSpool) RecoveryHealth() ([]string, []string, error) {
 	return recoverable, finalizations, nil
 }
 
-func (spool *DurableSpool) MarkSealed(recordingID string) error {
+func (spool *DurableSpool) MarkSealed(fence SpoolMutationFence) error {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	if manifest.Status == "sealed" {
@@ -515,11 +567,39 @@ func (spool *DurableSpool) MarkSealed(recordingID string) error {
 	return nil
 }
 
-func (spool *DurableSpool) RemoveCommitted(recordingID string) error {
+func (spool *DurableSpool) MarkFailed(fence SpoolMutationFence) error {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
 	manifest, err := spool.requireLocked(recordingID)
 	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
+		return err
+	}
+	if manifest.Status == "failed" {
+		return nil
+	}
+	candidate := cloneManifest(manifest)
+	candidate.Status = "failed"
+	if err := spool.persistLocked(candidate); err != nil {
+		spool.reloadAfterPersistFailureLocked(recordingID)
+		return err
+	}
+	spool.manifests[recordingID] = candidate
+	return nil
+}
+
+func (spool *DurableSpool) RemoveCommitted(fence SpoolMutationFence) error {
+	spool.mu.Lock()
+	defer spool.mu.Unlock()
+	recordingID := fence.RecordingID
+	manifest, err := spool.requireLocked(recordingID)
+	if err != nil {
+		return err
+	}
+	if err := requireSpoolFence(manifest, fence); err != nil {
 		return err
 	}
 	if err := spool.verifyRecordingDirectoriesLocked(recordingID, false); err != nil {
@@ -752,11 +832,29 @@ func (spool *DurableSpool) requireLocked(recordingID string) (*SpoolManifest, er
 	return manifest, nil
 }
 
+func requireSpoolFence(manifest *SpoolManifest, fence SpoolMutationFence) error {
+	invalidFence := fence.AttemptID == "" || fence.RecordingID == "" ||
+		fence.WorkerID == "" || fence.WorkerGenerationID == "" ||
+		fence.CaptureGeneration <= 0
+	if invalidFence {
+		return ErrAttemptFenceMismatch
+	}
+	exactOwner := manifest.AttemptID == fence.AttemptID &&
+		manifest.RecordingID == fence.RecordingID &&
+		manifest.WorkerID == fence.WorkerID &&
+		manifest.WorkerGenerationID == fence.WorkerGenerationID &&
+		manifest.CaptureGeneration == fence.CaptureGeneration
+	if !exactOwner {
+		return ErrAttemptFenceMismatch
+	}
+	return nil
+}
+
 func (spool *DurableSpool) verifyLocked(manifest *SpoolManifest) error {
 	validBinding := manifest.BindingMode == "capture" || manifest.BindingMode == "seal-only"
-	validStatus := manifest.Status == "capturing" || manifest.Status == "sealed"
+	validStatus := manifest.Status == "capturing" || manifest.Status == "sealed" || manifest.Status == "failed"
 	_, startedAtErr := time.Parse(time.RFC3339Nano, manifest.CaptureStartedAt)
-	invalidEnvelope := !validRecordingID(manifest.RecordingID) || manifest.WorkerID == "" ||
+	invalidEnvelope := len(manifest.AttemptID) > 128 || !validRecordingID(manifest.RecordingID) || manifest.WorkerID == "" ||
 		len(manifest.WorkerID) > 128 || manifest.WorkerGenerationID == "" ||
 		len(manifest.WorkerGenerationID) > 128 || manifest.CaptureGeneration <= 0 || startedAtErr != nil ||
 		!validBinding || !validStatus || manifest.SourceBytes < 0 || manifest.LastCheckpointSequence < -1 ||

@@ -118,24 +118,27 @@ func newControlHandler(
 			}
 		}
 		recoverable := []string{}
-		pendingFinalizations := manager.finalizations()
+		spoolFinalizations := []string{}
 		if reporter, ok := runner.(RecoveryHealthReporter); ok {
-			spoolRecoverable, spoolFinalizations, recoveryErr := reporter.RecoveryHealth()
-			recoverable = spoolRecoverable
-			pendingFinalizations = mergeSortedStrings(pendingFinalizations, spoolFinalizations)
+			var recoveryErr error
+			recoverable, spoolFinalizations, recoveryErr = reporter.RecoveryHealth()
 			if recoveryErr != nil {
 				statusCode = http.StatusServiceUnavailable
 				status = "not_ready"
 				capacity = 0
 			}
 		}
+		health := manager.healthSnapshot()
+		recoverable = excludeRecordingIDs(recoverable, health.activeRecordingIDs)
+		spoolFinalizations = excludeRecordingIDs(spoolFinalizations, health.activeRecordingIDs)
+		pendingFinalizations := mergeSortedStrings(health.pendingFinalizations, spoolFinalizations)
 		payload := map[string]any{
 			"status":                          status,
 			"workerId":                        config.WorkerID,
 			"generationId":                    config.GenerationID,
 			"capacity":                        capacity,
-			"occupiedSlots":                   manager.occupiedSlots(),
-			"attempts":                        manager.snapshots(),
+			"occupiedSlots":                   health.occupiedSlots,
+			"attempts":                        health.attempts,
 			"recoverableRecordingIds":         recoverable,
 			"pendingFinalizationRecordingIds": pendingFinalizations,
 		}
@@ -168,6 +171,7 @@ func newControlHandler(
 			return
 		}
 		state, createErr := manager.create(attempt)
+		var failedAttempt *failedAttemptError
 		switch {
 		case errors.Is(createErr, errWorkerFenceMismatch):
 			writeJSON(response, http.StatusConflict, map[string]string{"error": "WORKER_FENCE_MISMATCH"})
@@ -179,6 +183,8 @@ func newControlHandler(
 			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "WORKER_SHUTTING_DOWN"})
 		case errors.Is(createErr, errStartupFailed), errors.Is(createErr, errStartupTimeout):
 			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "BOT_START_FAILED"})
+		case errors.As(createErr, &failedAttempt):
+			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": failedAttempt.code})
 		case createErr != nil:
 			writeJSON(response, http.StatusInternalServerError, map[string]string{"error": "INTERNAL_ERROR"})
 		default:
@@ -193,11 +199,17 @@ func newControlHandler(
 			return
 		}
 		state, stopErr := manager.stop(request.PathValue("recordingId"))
-		if errors.Is(stopErr, errStopTimeout) {
+		var failedAttempt *failedAttemptError
+		switch {
+		case errors.Is(stopErr, errStopTimeout):
 			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": "BOT_STOP_TIMEOUT"})
-			return
+		case errors.As(stopErr, &failedAttempt):
+			writeJSON(response, http.StatusServiceUnavailable, map[string]string{"error": failedAttempt.code})
+		case stopErr != nil:
+			writeJSON(response, http.StatusInternalServerError, map[string]string{"error": "INTERNAL_ERROR"})
+		default:
+			writeJSON(response, http.StatusOK, map[string]string{"state": state})
 		}
-		writeJSON(response, http.StatusOK, map[string]string{"state": state})
 	})
 	if finalizer, ok := runner.(recording.AssignedFinalizationRunner); ok {
 		mux.HandleFunc("PUT /internal/v1/finalizations/{recordingId}", func(
@@ -391,6 +403,16 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 		return errors.New("unexpected trailing JSON")
 	}
 	return nil
+}
+
+func excludeRecordingIDs(recordingIDs []string, excluded map[string]struct{}) []string {
+	result := make([]string, 0, len(recordingIDs))
+	for _, recordingID := range recordingIDs {
+		if _, exists := excluded[recordingID]; !exists {
+			result = append(result, recordingID)
+		}
+	}
+	return result
 }
 
 func writeJSON(response http.ResponseWriter, status int, value any) {

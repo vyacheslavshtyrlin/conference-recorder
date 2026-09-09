@@ -13,9 +13,14 @@ import {
   verifyStagedSliceProbe,
   type ManifestPage,
   type ManifestSegment,
-  RetryableSourceDownloadError,
 } from "./compositionV2.js";
 import { executeV2Composition } from "./compositionV2Executor.js";
+import {
+  CompositionFailure,
+  failureReport,
+  retryableFailure,
+  terminalFailure,
+} from "./compositionFailure.js";
 import { ChildProcessRunner } from "./processRunner.js";
 
 const config = readConfig();
@@ -53,15 +58,14 @@ type ArtifactMetadata = {
 };
 type CompositionOutput = { path: string; expectedDurationSeconds: number };
 
-class TerminalApiError extends Error {
+class TerminalApiError extends CompositionFailure {
   constructor(readonly status: number) {
-    super(`composition API failed: ${status}`);
-  }
-}
-
-class RetryableCompositionError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
+    super(
+      "CONTROL_PLANE_REJECTED",
+      "control-plane",
+      false,
+      `Control plane rejected the request with status ${status}`,
+    );
   }
 }
 
@@ -81,13 +85,21 @@ class LeaseGuard {
   renew(expiresAt: string): void {
     const value = Date.parse(expiresAt);
     if (!Number.isFinite(value) || value <= Date.now()) {
-      this.abort(new RetryableCompositionError("composition lease expiry is invalid"));
+      this.abort(retryableFailure(
+        "COMPOSITION_LEASE_LOST",
+        "lease",
+        "Composition lease expiry is invalid",
+      ));
       return;
     }
     this.expiresAtMs = value;
     if (this.expiryTimer) clearTimeout(this.expiryTimer);
     this.expiryTimer = setTimeout(() => {
-      this.abort(new RetryableCompositionError("composition lease expired locally"));
+      this.abort(retryableFailure(
+        "COMPOSITION_LEASE_LOST",
+        "lease",
+        "Composition lease expired locally",
+      ));
     }, Math.max(1, value - Date.now()));
     this.expiryTimer.unref();
   }
@@ -134,7 +146,12 @@ async function apiRequest<T>(
       await delay(config.finalizeRetryDelayMs * (attempt + 1));
     }
   }
-  throw new RetryableCompositionError("composition API retries exhausted", { cause: lastError });
+  throw retryableFailure(
+    "CONTROL_PLANE_UNAVAILABLE",
+    "control-plane",
+    "Control plane request retries were exhausted",
+    lastError,
+  );
 }
 
 async function once(): Promise<void> {
@@ -175,7 +192,25 @@ async function once(): Promise<void> {
     const output = claim.job.inputProtocolVersion === "recording-capture.v2"
       ? await composeV2(jobId, leaseToken, directory, leaseHealthy, lease.signal)
       : await composeV1(jobId, leaseToken, directory, leaseHealthy, lease.signal);
-    const metadata = await verifyOutput(output.path, output.expectedDurationSeconds, lease.signal);
+    let metadata: ArtifactMetadata;
+    try {
+      metadata = await verifyOutput(output.path, output.expectedDurationSeconds, lease.signal);
+    } catch (error) {
+      if (lease.signal.aborted) {
+        throw retryableFailure(
+          "COMPOSITION_LEASE_LOST",
+          "lease",
+          "Composition lease was lost while verifying the artifact",
+          error,
+        );
+      }
+      throw terminalFailure(
+        "ARTIFACT_VERIFICATION_FAILED",
+        "artifact-verify",
+        "Final artifact verification failed",
+        error,
+      );
+    }
     assertLease(leaseHealthy);
     await uploadArtifact(jobId, leaseToken, output.path, metadata, leaseHealthy, lease.signal);
     assertLease(leaseHealthy);
@@ -185,22 +220,22 @@ async function once(): Promise<void> {
       leaseToken,
     );
   } catch (error) {
-    const retryable = (error instanceof RetryableCompositionError ||
-      error instanceof RetryableSourceDownloadError || lease.signal.aborted) &&
+    const report = failureReport(error);
+    const retryable = (report.retryable || lease.signal.aborted) &&
       claim.job.attempts < config.finalizeMaxAttempts;
     const endpoint = retryable ? "retry" : "fail";
     await apiRequest(
       `/internal/v1/composition-jobs/${jobId}/${endpoint}`,
       {
         body: {
-          code: retryable ? "COMPOSITION_RETRYABLE" : "COMPOSITION_FAILED",
-          message: sanitizeError(error),
+          code: report.code,
+          message: report.message,
         },
         retry: false,
       },
       leaseToken,
     ).catch(() => undefined);
-    console.error(error);
+    reportFailure("composition.job.failed", report);
   } finally {
     heartbeatStopped = true;
     heartbeatWake.abort();
@@ -237,7 +272,13 @@ async function composeV1(
     cursor = page.nextCursor;
     if (pages === 999) throw new Error("v1 segment page bound exceeded");
   }
-  if (!segments.length) throw new Error("composition source is empty");
+  if (!segments.length) {
+    throw terminalFailure(
+      "CAPTURE_EMPTY",
+      "source",
+      "V1 capture contains no committed segments",
+    );
+  }
 
   const files: string[] = [];
   let totalBytes = 0;
@@ -259,12 +300,24 @@ async function composeV1(
   const concat = join(directory, "input.txt");
   const output = join(directory, "output.mp4");
   await writeFile(concat, files.map((file) => `file '${escapeConcatPath(file)}'`).join("\n"), { mode: 0o640 });
-  await runner.run(config.ffmpegPath, [
-    "-hide_banner", "-loglevel", "error", "-y",
-    "-f", "concat", "-safe", "0", "-i", concat,
-    "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=24",
-    ...outputEncodingArguments(maximumOutputBytes), output,
-  ], config.ffmpegTimeoutMs, signal);
+  try {
+    await runner.run(config.ffmpegPath, [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "concat", "-safe", "0", "-i", concat,
+      "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=24",
+      ...outputEncodingArguments(maximumOutputBytes), output,
+    ], config.ffmpegTimeoutMs, signal);
+  } catch (error) {
+    if (signal.aborted || !leaseHealthy()) {
+      throw retryableFailure(
+        "COMPOSITION_LEASE_LOST",
+        "lease",
+        "Composition lease was lost while rendering",
+        error,
+      );
+    }
+    throw terminalFailure("RENDER_FAILED", "render", "Media rendering failed", error);
+  }
   return { path: output, expectedDurationSeconds: expectedStartMs / 1_000 };
 }
 
@@ -275,15 +328,27 @@ async function composeV2(
   leaseHealthy: () => boolean,
   signal: AbortSignal,
 ): Promise<CompositionOutput> {
-  const manifest = await loadCaptureV2Manifest(
-    (cursor) => apiRequest<ManifestPage>(
-      `/internal/v1/composition-jobs/${jobId}/capture-v2/manifest${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
-      { method: "GET", signal },
-      leaseToken,
-    ),
-    { maxSourceBytes: config.maxSourceBytes, maxDurationMs: config.maxDurationMs },
-  );
-  if (!manifest.segments.length) throw new Error("composition source is empty");
+  let manifest;
+  try {
+    manifest = await loadCaptureV2Manifest(
+      (cursor) => apiRequest<ManifestPage>(
+        `/internal/v1/composition-jobs/${jobId}/capture-v2/manifest${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+        { method: "GET", signal },
+        leaseToken,
+      ),
+      { maxSourceBytes: config.maxSourceBytes, maxDurationMs: config.maxDurationMs },
+    );
+  } catch (error) {
+    if (error instanceof CompositionFailure) {
+      throw error;
+    }
+    throw terminalFailure(
+      "CAPTURE_MANIFEST_INVALID",
+      "source",
+      "Capture manifest validation failed",
+      error,
+    );
+  }
   const paths = new Map<string, string>();
   for (let offset = 0; offset < manifest.segments.length; offset += 100) {
     assertLease(leaseHealthy);
@@ -301,32 +366,79 @@ async function composeV2(
       if (!url) throw new Error("source download is absent");
       const path = join(directory, `v2-${String(offset + index).padStart(6, "0")}.${segment.container === "matroska" ? "mkv" : "webm"}`);
       const response = await fetchSource(url, signal);
-      await downloadBoundedSource(response, segment, path);
+      try {
+        await downloadBoundedSource(response, segment, path);
+      } catch (error) {
+        if (error instanceof CompositionFailure) {
+          throw error;
+        }
+        throw terminalFailure(
+          "SOURCE_VALIDATION_FAILED",
+          "source",
+          "Downloaded source did not match its descriptor",
+          error,
+        );
+      }
       assertLease(leaseHealthy);
-      await probeSource(path, segment, signal);
+      try {
+        await probeSource(path, segment, signal);
+      } catch (error) {
+        if (signal.aborted) {
+          throw retryableFailure(
+            "COMPOSITION_LEASE_LOST",
+            "lease",
+            "Composition lease was lost while probing a source",
+            error,
+          );
+        }
+        throw terminalFailure(
+          "SOURCE_PROBE_FAILED",
+          "source",
+          "Downloaded source media probe failed",
+          error,
+        );
+      }
       paths.set(segment.uploadId, path);
     }
   }
   assertLease(leaseHealthy);
-  const output = await executeV2Composition({
-    manifest,
-    sourcePaths: paths,
-    directory,
-    ffmpegPath: config.ffmpegPath,
-    runner,
-    timeoutMs: config.ffmpegTimeoutMs,
-    maximumIntermediateBytes: config.maxSourceBytes,
-    maximumOutputBytes,
-    maximumWorkspaceBytes,
-    leaseHealthy,
-    signal,
-    verifySlice: async (path, expectedDurationSeconds) => {
-      const probe = await runner.run(config.ffprobePath, [
-        "-v", "error", "-show_streams", "-show_format", "-of", "json", path,
-      ], config.ffmpegTimeoutMs, signal);
-      verifyStagedSliceProbe(probe.stdout, expectedDurationSeconds);
-    },
-  });
+  let output: string;
+  try {
+    output = await executeV2Composition({
+      manifest,
+      sourcePaths: paths,
+      directory,
+      ffmpegPath: config.ffmpegPath,
+      runner,
+      timeoutMs: config.ffmpegTimeoutMs,
+      maximumIntermediateBytes: config.maxSourceBytes,
+      maximumOutputBytes,
+      maximumWorkspaceBytes,
+      leaseHealthy,
+      signal,
+      verifySlice: async (path, expectedDurationSeconds) => {
+        const probe = await runner.run(config.ffprobePath, [
+          "-v", "error", "-show_streams", "-show_format", "-of", "json", path,
+        ], config.ffmpegTimeoutMs, signal);
+        verifyStagedSliceProbe(probe.stdout, expectedDurationSeconds);
+      },
+    });
+  } catch (error) {
+    if (signal.aborted || !leaseHealthy()) {
+      throw retryableFailure(
+        "COMPOSITION_LEASE_LOST",
+        "lease",
+        "Composition lease was lost while rendering",
+        error,
+      );
+    }
+    throw terminalFailure(
+      "RENDER_FAILED",
+      "render",
+      "Media rendering failed",
+      error,
+    );
+  }
   return { path: output, expectedDurationSeconds: manifest.timelineEndMs / 1_000 };
 }
 
@@ -338,43 +450,55 @@ async function uploadArtifact(
   leaseHealthy: () => boolean,
   signal: AbortSignal,
 ): Promise<void> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < config.finalizeMaxAttempts; attempt += 1) {
-    assertLease(leaseHealthy);
-    const target = await apiRequest<{ uploadUrl: string; requiredHeaders?: Record<string, string> }>(
-      `/internal/v1/composition-jobs/${jobId}/output-upload`,
-      { body: metadata, signal },
-      leaseToken,
+  assertLease(leaseHealthy);
+  const target = await apiRequest<{ uploadUrl: string; requiredHeaders?: Record<string, string> }>(
+    `/internal/v1/composition-jobs/${jobId}/output-upload`,
+    { body: metadata, retry: false, signal },
+    leaseToken,
+  );
+  const headers = validatedArtifactHeaders(target.requiredHeaders, metadata.bytes);
+  let put: Response;
+  try {
+    put = await fetch(target.uploadUrl, {
+      method: "PUT",
+      headers,
+      body: createReadStream(path) as unknown as BodyInit,
+      duplex: "half",
+      signal: AbortSignal.any([signal, AbortSignal.timeout(config.artifactUploadTimeoutMs)]),
+    } as RequestInit & { duplex: "half" });
+  } catch (error) {
+    throw retryableFailure(
+      "ARTIFACT_UPLOAD_INTERRUPTED",
+      "artifact-upload",
+      "Final artifact upload was interrupted",
+      error,
     );
-    const headers = validatedArtifactHeaders(target.requiredHeaders, metadata.bytes);
-    try {
-      const put = await fetch(target.uploadUrl, {
-        method: "PUT",
-        headers,
-        body: createReadStream(path) as unknown as BodyInit,
-        duplex: "half",
-        signal: AbortSignal.any([signal, AbortSignal.timeout(config.artifactUploadTimeoutMs)]),
-      } as RequestInit & { duplex: "half" });
-      if (put.ok) return;
-      if (put.status < 500 && ![408, 425, 429].includes(put.status)) {
-        throw new TerminalApiError(put.status);
-      }
-      lastError = new Error(`artifact upload retryable status: ${put.status}`);
-    } catch (error) {
-      if (error instanceof TerminalApiError) throw error;
-      lastError = error;
-    }
-    if (attempt + 1 < config.finalizeMaxAttempts) {
-      await delay(config.finalizeRetryDelayMs * (attempt + 1));
-    }
   }
-  throw new RetryableCompositionError("artifact upload retries exhausted", { cause: lastError });
+  if (put.ok) {
+    return;
+  }
+  if (put.status >= 500 || [408, 425, 429].includes(put.status)) {
+    throw retryableFailure(
+      "ARTIFACT_STORAGE_UNAVAILABLE",
+      "artifact-upload",
+      `Artifact storage returned retryable status ${put.status}`,
+    );
+  }
+  throw terminalFailure(
+    "ARTIFACT_UPLOAD_REJECTED",
+    "artifact-upload",
+    `Artifact storage rejected the upload with status ${put.status}`,
+  );
 }
 
 function validatedArtifactHeaders(required: Record<string, string> | undefined, bytes: number) {
   const headers = new Headers(required);
   if (headers.get("content-length") !== String(bytes) || headers.get("content-type") !== "video/mp4") {
-    throw new Error("artifact upload headers do not match verified metadata");
+    throw terminalFailure(
+      "ARTIFACT_UPLOAD_CONTRACT_INVALID",
+      "artifact-upload",
+      "Artifact upload headers do not match verified metadata",
+    );
   }
   return headers;
 }
@@ -386,7 +510,13 @@ function validateV1Segment(segment: V1Segment, expectedStartMs: number): void {
     Number.isSafeInteger(segment.timelineEndMs) && segment.timelineEndMs > segment.timelineStartMs &&
     Number.isSafeInteger(segment.bytes) && segment.bytes > 0 &&
     /^[0-9a-f]{64}$/.test(segment.sha256) && Boolean(segment.download?.url);
-  if (!valid || segment.timelineEndMs > config.maxDurationMs) throw new Error("invalid v1 segment descriptor");
+  if (!valid || segment.timelineEndMs > config.maxDurationMs) {
+    throw terminalFailure(
+      "SOURCE_VALIDATION_FAILED",
+      "source",
+      "V1 source segment descriptor is invalid",
+    );
+  }
 }
 
 async function downloadExact(
@@ -395,9 +525,21 @@ async function downloadExact(
   expectedBytes: number,
   expectedSHA256: string,
 ): Promise<void> {
-  if (!response.body) throw new RetryableCompositionError("segment download body is absent");
+  if (!response.body) {
+    throw retryableFailure(
+      "SOURCE_DOWNLOAD_INTERRUPTED",
+      "source",
+      "Source download body is absent",
+    );
+  }
   const declared = response.headers.get("content-length");
-  if (declared !== null && Number(declared) !== expectedBytes) throw new Error("segment content-length mismatch");
+  if (declared !== null && Number(declared) !== expectedBytes) {
+    throw terminalFailure(
+      "SOURCE_VALIDATION_FAILED",
+      "source",
+      "Source content length does not match its descriptor",
+    );
+  }
   const file = await open(path, "wx", 0o640);
   const digest = createHash("sha256");
   let written = 0;
@@ -408,21 +550,40 @@ async function downloadExact(
       try {
         chunk = await reader.read();
       } catch (error) {
-        throw new RetryableCompositionError("segment response body interrupted", { cause: error });
+        throw retryableFailure(
+          "SOURCE_DOWNLOAD_INTERRUPTED",
+          "source",
+          "Source response body was interrupted",
+          error,
+        );
       }
       if (chunk.done) break;
       if (written + chunk.value.byteLength > expectedBytes) {
         await reader.cancel();
-        throw new Error("segment download exceeded byte bound");
+        throw terminalFailure(
+          "SOURCE_VALIDATION_FAILED",
+          "source",
+          "Source download exceeded its byte bound",
+        );
       }
       written += chunk.value.byteLength;
       digest.update(chunk.value);
       await file.write(chunk.value);
     }
     if (written !== expectedBytes) {
-      throw new RetryableCompositionError("segment response body ended early");
+      throw retryableFailure(
+        "SOURCE_DOWNLOAD_INTERRUPTED",
+        "source",
+        "Source response body ended early",
+      );
     }
-    if (digest.digest("hex") !== expectedSHA256) throw new Error("segment checksum mismatch");
+    if (digest.digest("hex") !== expectedSHA256) {
+      throw terminalFailure(
+        "SOURCE_VALIDATION_FAILED",
+        "source",
+        "Source checksum does not match its descriptor",
+      );
+    }
     await file.sync();
   } finally {
     await file.close();
@@ -436,20 +597,35 @@ async function fetchSource(url: string, leaseSignal: AbortSignal): Promise<Respo
       signal: AbortSignal.any([leaseSignal, AbortSignal.timeout(config.httpTimeoutMs)]),
     });
   } catch (error) {
-    throw new RetryableCompositionError("segment download request failed", { cause: error });
+    throw retryableFailure(
+      "SOURCE_DOWNLOAD_INTERRUPTED",
+      "source",
+      "Source download request failed",
+      error,
+    );
   }
   if (!response.ok) {
     if (response.status >= 500 || [408, 425, 429].includes(response.status)) {
-      throw new RetryableCompositionError(`segment download retryable status: ${response.status}`);
+      throw retryableFailure(
+        "SOURCE_STORAGE_UNAVAILABLE",
+        "source",
+        `Source storage returned retryable status ${response.status}`,
+      );
     }
-    throw new Error(`segment download failed: ${response.status}`);
+    throw terminalFailure(
+      "SOURCE_DOWNLOAD_REJECTED",
+      "source",
+      `Source storage rejected the download with status ${response.status}`,
+    );
   }
   return response;
 }
 
 async function probeSource(path: string, segment: ManifestSegment, signal: AbortSignal): Promise<void> {
   const probe = await runner.run(config.ffprobePath, [
-    "-v", "error", "-show_streams", "-show_format", "-of", "json", path,
+    "-v", "error",
+    "-show_entries", "stream=codec_type,codec_name:format=duration:packet=pts_time,duration_time",
+    "-show_packets", "-of", "json", path,
   ], config.ffmpegTimeoutMs, signal);
   verifySourceProbe(probe.stdout, segment);
 }
@@ -497,15 +673,17 @@ function heartbeatDelay(expiresAtMs: number): number {
 }
 
 function assertLease(leaseHealthy: () => boolean): void {
-  if (!leaseHealthy()) throw new RetryableCompositionError("composition lease heartbeat failed");
+  if (!leaseHealthy()) {
+    throw retryableFailure(
+      "COMPOSITION_LEASE_LOST",
+      "lease",
+      "Composition lease is no longer healthy",
+    );
+  }
 }
 
 function escapeConcatPath(path: string): string {
   return path.replaceAll("'", "'\\''");
-}
-
-function sanitizeError(error: unknown): string {
-  return String(error).replace(/[\r\n\t]+/g, " ").slice(0, 512);
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -534,10 +712,24 @@ async function main(): Promise<void> {
     try {
       await once();
     } catch (error) {
-      console.error("composition claim loop failed", error);
+      reportFailure("composition.claim.failed", failureReport(error));
     }
     await delay(2_000);
   }
+}
+
+function reportFailure(
+  event: "composition.job.failed" | "composition.claim.failed",
+  report: { code: string; message: string; retryable: boolean; diagnostic?: string },
+): void {
+  console.error(JSON.stringify({
+    event,
+    code: report.code.slice(0, 64),
+    message: report.message.replace(/[\r\n\t]+/g, " ").slice(0, 512),
+    ...(report.diagnostic ? { diagnostic: report.diagnostic } : {}),
+    retryable: report.retryable,
+    outcome: "failure",
+  }));
 }
 
 function startHealthServer(): void {

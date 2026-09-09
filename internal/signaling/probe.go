@@ -11,6 +11,8 @@ import (
 
 var ErrAuthoritativeStop = errors.New("authoritative recording stop")
 
+const trackArrivalTimeout = 10 * time.Second
+
 // PeerSession is the receive-only WebRTC lifecycle controlled by signaling.
 type PeerSession interface {
 	ReconcileConsumers(
@@ -25,23 +27,45 @@ type PeerSession interface {
 // ProbeController binds ordered v1 lifecycle events to server consumers and a
 // dynamically renegotiated Pion receive session.
 type ProbeController struct {
-	signaling         SignalingClient
-	peer              PeerSession
-	transport         TransportOptions
-	rtpCapabilities   json.RawMessage
-	reconciler        *Reconciler
-	consumers         map[string]Consumer
-	consumerOrder     []string
-	connected         bool
-	mu                sync.Mutex
-	terminal          bool
-	authoritativeStop bool
-	observer          LifecycleObserver
+	signaling          SignalingClient
+	peer               PeerSession
+	transport          TransportOptions
+	rtpCapabilities    json.RawMessage
+	reconciler         *Reconciler
+	consumers          map[string]Consumer
+	consumerOrder      []string
+	connected          bool
+	mu                 sync.Mutex
+	terminal           bool
+	authoritativeStop  bool
+	observer           LifecycleObserver
+	readinessFailures  chan readinessFailure
+	readinessCancels   map[string]context.CancelFunc
+	readinessEpochs    map[string]uint64
+	nextReadinessEpoch uint64
+	lifecycleDone      chan struct{}
+	lifecycleDoneOnce  sync.Once
+}
+
+type readinessFailure struct {
+	producerID string
+	epoch      uint64
+	err        error
+}
+
+type ProbeState struct {
+	Participants []Participant
+	Producers    []Producer
 }
 
 type LifecycleObserver interface {
 	Snapshot(context.Context, Snapshot) error
 	Event(context.Context, Event) error
+}
+
+type trackReadiness interface {
+	ResetTrack(producerID string)
+	WaitForTrack(ctx context.Context, producerID string) error
 }
 
 // StartProbe establishes the authoritative snapshot and initial consumers.
@@ -80,14 +104,18 @@ func StartProbeWithObserver(
 	}
 
 	controller := &ProbeController{
-		signaling:       signaling,
-		peer:            peer,
-		transport:       transport,
-		rtpCapabilities: rtpCapabilities,
-		reconciler:      reconciler,
-		consumers:       map[string]Consumer{},
-		consumerOrder:   []string{},
-		observer:        observer,
+		signaling:         signaling,
+		peer:              peer,
+		transport:         transport,
+		rtpCapabilities:   rtpCapabilities,
+		reconciler:        reconciler,
+		consumers:         map[string]Consumer{},
+		consumerOrder:     []string{},
+		observer:          observer,
+		readinessFailures: make(chan readinessFailure, 1),
+		readinessCancels:  map[string]context.CancelFunc{},
+		readinessEpochs:   map[string]uint64{},
+		lifecycleDone:     make(chan struct{}),
 	}
 	if observer != nil {
 		if err := observer.Snapshot(ctx, snapshot); err != nil {
@@ -98,16 +126,24 @@ func StartProbeWithObserver(
 		if producer.Paused {
 			continue
 		}
-		if err := controller.ensureAndResume(ctx, producer); err != nil {
+		controller.mu.Lock()
+		err := controller.ensureAndResume(ctx, producer)
+		controller.mu.Unlock()
+		if err != nil {
 			return nil, controller.fail(err)
 		}
 	}
 	return controller, nil
 }
 
-// Reconciler returns the controller's authoritative in-memory state.
-func (controller *ProbeController) Reconciler() *Reconciler {
-	return controller.reconciler
+// State returns a copied point-in-time view of the authoritative roster.
+func (controller *ProbeController) State() ProbeState {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return ProbeState{
+		Participants: controller.reconciler.participantsSnapshot(),
+		Producers:    controller.reconciler.Producers(),
+	}
 }
 
 // WhileActive runs action only while lifecycle termination has not begun.
@@ -128,13 +164,14 @@ func (controller *ProbeController) WhileActive(ctx context.Context, action func(
 
 // Run applies lifecycle events until context cancellation or signaling close.
 func (controller *ProbeController) Run(ctx context.Context) error {
+	defer controller.stopLifecycle()
 	for {
 		select {
 		case <-ctx.Done():
-			return controller.fail(ctx.Err())
+			return ctx.Err()
 		case event, open := <-controller.signaling.Lifecycle():
 			if !open {
-				return controller.fail(errors.New("private signaling lifecycle closed"))
+				return errors.New("private signaling lifecycle closed")
 			}
 			if event.Type == "bot:stop" {
 				controller.mu.Lock()
@@ -144,6 +181,10 @@ func (controller *ProbeController) Run(ctx context.Context) error {
 			}
 			if err := controller.Apply(ctx, event); err != nil {
 				return err
+			}
+		case failure := <-controller.readinessFailures:
+			if controller.acceptReadinessFailure(failure) {
+				return failure.err
 			}
 		}
 	}
@@ -241,9 +282,12 @@ func (controller *ProbeController) ensureAndResume(
 	if err := controller.signaling.ResumeConsumer(ctx, producer.ProducerID); err != nil {
 		return controller.failLocked(fmt.Errorf("resume consumer: %w", err))
 	}
+	controller.watchTrackReadinessLocked(ctx, producer.ProducerID)
 	if producer.Kind == KindVideo {
 		ssrc := consumer.RTPParameters.Encodings[0].SSRC
-		if err := controller.peer.RequestKeyFrame(ctx, ssrc); err != nil {
+		keyFrameContext, cancel := context.WithTimeout(ctx, trackArrivalTimeout)
+		defer cancel()
+		if err := controller.peer.RequestKeyFrame(keyFrameContext, ssrc); err != nil {
 			return controller.failLocked(fmt.Errorf("request key frame: %w", err))
 		}
 	}
@@ -251,6 +295,7 @@ func (controller *ProbeController) ensureAndResume(
 }
 
 func (controller *ProbeController) pause(ctx context.Context, producerID string) error {
+	controller.cancelTrackReadinessLocked(producerID)
 	if _, exists := controller.consumers[producerID]; !exists {
 		return nil
 	}
@@ -264,17 +309,87 @@ func (controller *ProbeController) closeConsumer(
 	ctx context.Context,
 	producerID string,
 ) error {
+	controller.cancelTrackReadinessLocked(producerID)
 	if _, exists := controller.consumers[producerID]; !exists {
 		return nil
 	}
 	if err := controller.signaling.CloseConsumer(ctx, producerID); err != nil {
 		return controller.failLocked(fmt.Errorf("close consumer: %w", err))
 	}
+	if readiness, ok := controller.peer.(trackReadiness); ok {
+		readiness.ResetTrack(producerID)
+	}
 	controller.removeConsumerLocked(producerID)
 	if err := controller.renegotiate(ctx); err != nil {
 		return controller.failLocked(err)
 	}
 	return nil
+}
+
+func (controller *ProbeController) watchTrackReadinessLocked(ctx context.Context, producerID string) {
+	readiness, ok := controller.peer.(trackReadiness)
+	if !ok {
+		return
+	}
+	controller.cancelTrackReadinessLocked(producerID)
+	controller.nextReadinessEpoch++
+	epoch := controller.nextReadinessEpoch
+	trackContext, cancel := context.WithTimeout(ctx, trackArrivalTimeout)
+	controller.readinessCancels[producerID] = cancel
+	controller.readinessEpochs[producerID] = epoch
+	go func() {
+		err := readiness.WaitForTrack(trackContext, producerID)
+		cancel()
+		if err == nil || errors.Is(err, context.Canceled) {
+			controller.clearTrackReadiness(producerID, epoch)
+			return
+		}
+		failure := readinessFailure{
+			producerID: producerID,
+			epoch:      epoch,
+			err:        fmt.Errorf("wait for producer media: %w", err),
+		}
+		select {
+		case controller.readinessFailures <- failure:
+		case <-ctx.Done():
+			controller.clearTrackReadiness(producerID, epoch)
+		case <-controller.lifecycleDone:
+			controller.clearTrackReadiness(producerID, epoch)
+		}
+	}()
+}
+
+func (controller *ProbeController) cancelTrackReadinessLocked(producerID string) {
+	if cancel := controller.readinessCancels[producerID]; cancel != nil {
+		cancel()
+	}
+	delete(controller.readinessCancels, producerID)
+	delete(controller.readinessEpochs, producerID)
+}
+
+func (controller *ProbeController) clearTrackReadiness(producerID string, epoch uint64) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.readinessEpochs[producerID] != epoch {
+		return
+	}
+	delete(controller.readinessCancels, producerID)
+	delete(controller.readinessEpochs, producerID)
+}
+
+func (controller *ProbeController) acceptReadinessFailure(failure readinessFailure) bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.terminal || controller.readinessEpochs[failure.producerID] != failure.epoch {
+		return false
+	}
+	producer, exists := controller.producer(failure.producerID)
+	if !exists || producer.Paused {
+		controller.cancelTrackReadinessLocked(failure.producerID)
+		return false
+	}
+	controller.cancelTrackReadinessLocked(failure.producerID)
+	return true
 }
 
 func (controller *ProbeController) removeConsumerLocked(producerID string) {
@@ -342,6 +457,10 @@ func (controller *ProbeController) failLocked(cause error) error {
 		return cause
 	}
 	controller.terminal = true
+	controller.lifecycleDoneOnce.Do(func() { close(controller.lifecycleDone) })
+	for producerID := range controller.readinessCancels {
+		controller.cancelTrackReadinessLocked(producerID)
+	}
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	errorsFound := []error{}
@@ -362,6 +481,15 @@ func (controller *ProbeController) failLocked(cause error) error {
 		errorsFound = append(errorsFound, fmt.Errorf("close signaling: %w", err))
 	}
 	return errors.Join(errorsFound...)
+}
+
+func (controller *ProbeController) stopLifecycle() {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	controller.lifecycleDoneOnce.Do(func() { close(controller.lifecycleDone) })
+	for producerID := range controller.readinessCancels {
+		controller.cancelTrackReadinessLocked(producerID)
+	}
 }
 
 func producerIdentityChanged(previous, next Producer) bool {

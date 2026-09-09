@@ -58,6 +58,8 @@ type PionSession struct {
 	disconnectGeneration uint64
 	slots                map[string]Consumer
 	order                []string
+	trackMu              sync.Mutex
+	trackArrivals        map[string]chan struct{}
 }
 
 // TrackEvent correlates a Pion remote track with its private in-memory
@@ -85,13 +87,14 @@ func NewPionSession() (*PionSession, error) {
 	}
 
 	session := &PionSession{
-		connection: connection,
-		tracks:     make(chan TrackEvent, maxPionMediaSections),
-		errors:     make(chan error, 1),
-		done:       make(chan struct{}),
-		connected:  make(chan struct{}),
-		slots:      map[string]Consumer{},
-		order:      []string{},
+		connection:    connection,
+		tracks:        make(chan TrackEvent, maxPionMediaSections),
+		errors:        make(chan error, 1),
+		done:          make(chan struct{}),
+		connected:     make(chan struct{}),
+		slots:         map[string]Consumer{},
+		order:         []string{},
+		trackArrivals: map[string]chan struct{}{},
 	}
 	connection.OnTrack(session.deliverTrack)
 	connection.OnConnectionStateChange(session.connectionStateChanged)
@@ -106,6 +109,31 @@ func (session *PionSession) Tracks() <-chan TrackEvent {
 // Errors reports terminal bounded-backpressure failures from track delivery.
 func (session *PionSession) Errors() <-chan error {
 	return session.errors
+}
+
+func (session *PionSession) ResetTrack(producerID string) {
+	session.trackMu.Lock()
+	delete(session.trackArrivals, producerID)
+	session.trackMu.Unlock()
+}
+
+func (session *PionSession) WaitForTrack(ctx context.Context, producerID string) error {
+	session.trackMu.Lock()
+	arrival := session.trackArrivals[producerID]
+	if arrival == nil {
+		arrival = make(chan struct{})
+		session.trackArrivals[producerID] = arrival
+	}
+	session.trackMu.Unlock()
+
+	select {
+	case <-arrival:
+		return nil
+	case <-session.done:
+		return errors.New("Pion session closed before producer media arrived")
+	case <-ctx.Done():
+		return fmt.Errorf("producer media arrival: %w", ctx.Err())
+	}
 }
 
 // AcceptConsumers applies a synthetic mediasoup remote offer and returns the
@@ -266,18 +294,38 @@ func (session *PionSession) deliverTrack(
 			Track:       track,
 			SourceTrack: PionTrackSource{Track: track},
 		}
-		session.enqueueTrack(event)
+		if session.enqueueTrack(event) {
+			session.markTrackReady(consumer.ProducerID)
+		}
 		return
 	}
 }
 
-func (session *PionSession) enqueueTrack(event TrackEvent) {
+func (session *PionSession) enqueueTrack(event TrackEvent) bool {
 	select {
 	case session.tracks <- event:
+		return true
 	case <-session.done:
+		return false
 	default:
 		session.fail(errors.New("Pion track delivery backpressure exceeded"))
+		return false
 	}
+}
+
+func (session *PionSession) markTrackReady(producerID string) {
+	session.trackMu.Lock()
+	arrival := session.trackArrivals[producerID]
+	if arrival == nil {
+		arrival = make(chan struct{})
+		session.trackArrivals[producerID] = arrival
+	}
+	select {
+	case <-arrival:
+	default:
+		close(arrival)
+	}
+	session.trackMu.Unlock()
 }
 
 func (session *PionSession) connectionStateChanged(state webrtc.PeerConnectionState) {
@@ -672,11 +720,29 @@ func validSDPToken(value string) bool {
 	return true
 }
 
-// ExtractDTLSParameters extracts Pion's local certificate fingerprint from an
-// answer and fixes the client role required against mediasoup's DTLS server.
+// ExtractDTLSParameters extracts Pion's local DTLS role and certificate
+// fingerprint from an answer.
 func ExtractDTLSParameters(answerSDP string) (DTLSParameters, error) {
+	role := ""
+	fingerprints := []DTLSFingerprint{}
 	for _, line := range strings.Split(answerSDP, "\n") {
 		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "a=setup:") {
+			candidateRole := ""
+			switch strings.TrimPrefix(line, "a=setup:") {
+			case "active":
+				candidateRole = "client"
+			case "passive":
+				candidateRole = "server"
+			default:
+				return DTLSParameters{}, errors.New("invalid Pion DTLS setup role")
+			}
+			if role != "" && role != candidateRole {
+				return DTLSParameters{}, errors.New("inconsistent Pion DTLS setup roles")
+			}
+			role = candidateRole
+			continue
+		}
 		if !strings.HasPrefix(line, "a=fingerprint:") {
 			continue
 		}
@@ -684,13 +750,19 @@ func ExtractDTLSParameters(answerSDP string) (DTLSParameters, error) {
 		if len(fields) != 2 {
 			return DTLSParameters{}, errors.New("invalid Pion DTLS fingerprint")
 		}
-		return DTLSParameters{
-			Role: "client",
-			Fingerprints: []DTLSFingerprint{{
+		fingerprints = append(
+			fingerprints,
+			DTLSFingerprint{
 				Algorithm: fields[0],
 				Value:     fields[1],
-			}},
-		}, nil
+			},
+		)
 	}
-	return DTLSParameters{}, errors.New("Pion answer has no DTLS fingerprint")
+	if role == "" {
+		return DTLSParameters{}, errors.New("Pion answer has no DTLS setup role")
+	}
+	if len(fingerprints) == 0 {
+		return DTLSParameters{}, errors.New("Pion answer has no DTLS fingerprint")
+	}
+	return DTLSParameters{Role: role, Fingerprints: fingerprints}, nil
 }

@@ -80,6 +80,35 @@ function stagedFiltergraph(value: CaptureV2Manifest): string {
 }
 
 describe("capture-v2 production staging goldens", () => {
+  it("renders black and silence around delayed authoritative participant presence", () => {
+    const value = manifest({
+      participantInstances: [participant("pi-a", "Alex")],
+      participantIntervals: [
+        { participantInstanceId: "pi-a", startMs: 2_000, endMs: 8_000 },
+      ],
+    });
+
+    const result = compileV2StagingPlan(value);
+
+    expect(result.scenes.map((scene) => [scene.startMs, scene.endMs])).toEqual([
+      [0, 2_000],
+      [2_000, 8_000],
+      [8_000, 10_000],
+    ]);
+    expect(result.scenes[0]!.baseFiltergraph).toContain("c=0x090f1c");
+    expect(result.scenes[1]!.videoPasses[0]!.filtergraph).toContain("text='A'");
+    expect(result.scenes[2]!.baseFiltergraph).toContain("c=0x090f1c");
+  });
+
+  it("rejects a completely empty zero-media timeline", async () => {
+    await expect(loadCaptureV2Manifest(async () => ({
+      ...manifest({}),
+      nextCursor: null,
+    }))).rejects.toThrow(
+      "zero-media v2 manifest has no authoritative participant timeline",
+    );
+  });
+
   it("renders camera-only grid with a name overlay", () => {
     const value = manifest({
       participantInstances: [participant("pi-a", "Alex")],
@@ -352,7 +381,14 @@ describe("capture-v2 manifest and source bounds", () => {
       gaps: [],
     };
     const pages: ManifestPage[] = [
-      { ...base, participantInstances: [participant("pi-a")], nextCursor: "next" },
+      {
+        ...base,
+        participantInstances: [participant("pi-a")],
+        participantIntervals: [
+          { participantInstanceId: "pi-a", startMs: 0, endMs: 10 },
+        ],
+        nextCursor: "next",
+      },
       { ...base, participantInstances: [], nextCursor: null },
     ];
     let index = 0;
@@ -401,6 +437,54 @@ describe("capture-v2 manifest and source bounds", () => {
     });
     expect(() => verifySourceProbe(probe(10), descriptor)).not.toThrow();
     expect(() => verifySourceProbe(probe(1), descriptor)).toThrow("probe verification");
+  });
+  it("derives duration from packet timestamps for non-seekable short WebM segments", () => {
+    const descriptor = segment("upload", "trk", "pi", "mic", 0, 114);
+    const probe = JSON.stringify({
+      streams: [{ codec_type: "audio", codec_name: "opus" }],
+      format: {},
+      packets: [
+        { pts_time: "-0.080000", duration_time: "0.020000" },
+        { pts_time: "0.100000", duration_time: "0.020000" },
+      ],
+    });
+    expect(() => verifySourceProbe(probe, descriptor)).not.toThrow();
+  });
+  it("allows bounded RTP-to-wall-clock skew in packet-derived source duration", () => {
+    const descriptor = segment("upload", "trk", "pi", "screen", 0, 10_077);
+    const probe = JSON.stringify({
+      streams: [{ codec_type: "video", codec_name: "vp8" }],
+      format: {},
+      packets: [
+        { pts_time: "0.000000", duration_time: "0.033000" },
+        { pts_time: "11.100000", duration_time: "0.033000" },
+      ],
+    });
+    expect(() => verifySourceProbe(probe, descriptor)).not.toThrow();
+  });
+  it("rejects packet-derived media that is materially shorter than its descriptor", () => {
+    const descriptor = segment("upload", "trk", "pi", "mic", 0, 5_000);
+    const probe = JSON.stringify({
+      streams: [{ codec_type: "audio", codec_name: "opus" }],
+      format: {},
+      packets: [
+        { pts_time: "0.000000", duration_time: "0.020000" },
+        { pts_time: "0.080000", duration_time: "0.020000" },
+      ],
+    });
+    expect(() => verifySourceProbe(probe, descriptor)).toThrow("probe verification");
+  });
+  it("rejects packet-derived media beyond the bounded RTP clock tolerance", () => {
+    const descriptor = segment("upload", "trk", "pi", "camera", 0, 5_000);
+    const probe = JSON.stringify({
+      streams: [{ codec_type: "video", codec_name: "vp8" }],
+      format: {},
+      packets: [
+        { pts_time: "0.000000", duration_time: "0.033000" },
+        { pts_time: "6.100000", duration_time: "0.033000" },
+      ],
+    });
+    expect(() => verifySourceProbe(probe, descriptor)).toThrow("probe verification");
   });
   it("requires a full-duration audio stream in the verified v2 artifact", () => {
     const probe = (audioDuration?: string) => JSON.stringify({

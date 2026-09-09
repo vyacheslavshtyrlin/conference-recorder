@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -35,6 +36,8 @@ type packetWriterFactory func(codec, path string, first *rtp.Packet) (packetWrit
 
 type SegmentReady func(context.Context, SegmentDescriptor, string) error
 
+type InitialTrackGap func(startMS, endMS int64) error
+
 type StagingBudget interface {
 	ResizeStaging(recordingID, path string, size int64) error
 	ReleaseStaging(recordingID, path string)
@@ -52,6 +55,8 @@ type RTPTrackWriter struct {
 	clock               func() int64
 	muxer               SegmentMuxer
 	ready               SegmentReady
+	initialGap          InitialTrackGap
+	coverageStartMS     int64
 	newPacketWriter     packetWriterFactory
 	initialSequence     int32
 	operationTimeout    time.Duration
@@ -90,6 +95,8 @@ type RTPTrackWriterConfig struct {
 	TimelineClock          func() int64
 	Muxer                  SegmentMuxer
 	OnSegment              SegmentReady
+	OnInitialGap           InitialTrackGap
+	CoverageStartMS        int64
 	InitialSequence        int32
 	OperationTimeout       time.Duration
 	MaximumStorageBytes    int64
@@ -114,10 +121,11 @@ func StartRTPTrackWriter(ctx context.Context, config RTPTrackWriterConfig) (*RTP
 		config.MaximumSegmentDuration < config.SegmentDuration
 	if config.Track == nil || invalidIdentity || config.SpoolDirectory == "" || invalidDuration ||
 		config.TimelineClock == nil || config.Muxer == nil || config.OnSegment == nil ||
-		config.InitialSequence < 0 || config.OperationTimeout <= 0 || config.MaximumStorageBytes < 1 {
+		config.InitialSequence < 0 || config.OperationTimeout <= 0 || config.MaximumStorageBytes < 1 ||
+		config.CoverageStartMS < 0 {
 		return nil, errors.New("invalid RTP track writer configuration")
 	}
-	container, _, _, err := mediaTuple(config.Source, config.Codec)
+	container, codec, _, err := mediaTuple(config.Source, config.Codec)
 	if err != nil || container == "" {
 		return nil, errors.New("invalid RTP track writer codec")
 	}
@@ -136,9 +144,10 @@ func StartRTPTrackWriter(ctx context.Context, config RTPTrackWriterConfig) (*RTP
 	}
 	writer := &RTPTrackWriter{
 		track: config.Track, participantID: config.ParticipantInstanceID, trackID: config.TrackID,
-		source: config.Source, codec: config.Codec, spoolDirectory: filepath.Clean(config.SpoolDirectory),
+		source: config.Source, codec: codec, spoolDirectory: filepath.Clean(config.SpoolDirectory),
 		segmentDuration: config.SegmentDuration, maximumDuration: config.MaximumSegmentDuration,
 		clock: config.TimelineClock, muxer: config.Muxer, ready: config.OnSegment,
+		initialGap: config.OnInitialGap, coverageStartMS: config.CoverageStartMS,
 		newPacketWriter: packetFactory, initialSequence: config.InitialSequence,
 		operationTimeout:    config.OperationTimeout,
 		maximumStorageBytes: config.MaximumStorageBytes,
@@ -235,6 +244,7 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 	var intermediateReserved int64
 	closedSegments := make(chan closedTrackSegment, trackSegmentQueueSize)
 	processingDone := make(chan error, 1)
+	processingFailed := make(chan struct{})
 	go func() {
 		var result error
 		for segment := range closedSegments {
@@ -245,6 +255,7 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 			}
 			if err := writer.processClosedSegment(writer.processingContext, segment); err != nil {
 				result = err
+				close(processingFailed)
 				_ = writer.track.SetReadDeadline(time.Now())
 			}
 		}
@@ -265,6 +276,20 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 		result = errors.Join(result, <-processingDone)
 	}()
 	parameterSets := h264ParameterSets{}
+	coverageStarted := false
+	startCoverage := func(atMS int64) error {
+		if coverageStarted {
+			return nil
+		}
+		if atMS < writer.coverageStartMS {
+			return errors.New("RTP coverage precedes active track interval")
+		}
+		coverageStarted = true
+		if writer.initialGap == nil {
+			return nil
+		}
+		return writer.initialGap(writer.coverageStartMS, atMS)
+	}
 	openSegment := func(packet *rtp.Packet, now int64) error {
 		segmentStart = now
 		filename := writer.trackID + "-" + sequenceString(sequence) + "-w" + writer.stagingID +
@@ -280,6 +305,9 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 			return err
 		}
 		intermediateReserved = reserved
+		if err := startCoverage(now); err != nil {
+			return err
+		}
 		if writer.codec != "h264" {
 			return nil
 		}
@@ -300,6 +328,10 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 		if current == nil {
 			return nil
 		}
+		authoritativeEnd, authoritative := writer.authoritativeCloseBoundary()
+		if authoritative && endMS > authoritativeEnd {
+			endMS = authoritativeEnd
+		}
 		const closeAllowance = int64(64 * 1024)
 		if err := writer.stagingBudget.ResizeStaging(
 			writer.recordingID,
@@ -317,6 +349,13 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 			return err
 		}
 		if !havePackets {
+			_ = os.Remove(intermediate)
+			writer.stagingBudget.ReleaseStaging(writer.recordingID, intermediate)
+			intermediate = ""
+			intermediateReserved = 0
+			return nil
+		}
+		if authoritative && endMS <= segmentStart {
 			_ = os.Remove(intermediate)
 			writer.stagingBudget.ReleaseStaging(writer.recordingID, intermediate)
 			intermediate = ""
@@ -346,10 +385,33 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 	for {
 		packet, err := writer.track.ReadRTP()
 		if err != nil {
-			if ctx.Err() != nil {
-				return closeSegment(writer.closingBoundary())
+			if isRemoteTrackEnd(err) {
+				select {
+				case <-ctx.Done():
+					boundary := writer.closingBoundary()
+					if gapErr := startCoverage(boundary); gapErr != nil {
+						return gapErr
+					}
+					return closeSegment(boundary)
+				case <-processingFailed:
+					return nil
+				}
 			}
-			return errors.New("read remote RTP track")
+			if ctx.Err() != nil {
+				boundary := writer.closingBoundary()
+				if gapErr := startCoverage(boundary); gapErr != nil {
+					return gapErr
+				}
+				return closeSegment(boundary)
+			}
+			return errors.Join(fmt.Errorf("read remote RTP track: %w", err), startCoverage(writer.clock()))
+		}
+		if ctx.Err() != nil {
+			boundary := writer.closingBoundary()
+			if gapErr := startCoverage(boundary); gapErr != nil {
+				return gapErr
+			}
+			return closeSegment(boundary)
 		}
 		now := writer.clock()
 		if writer.codec == "h264" {
@@ -387,6 +449,23 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 		}
 		havePackets = true
 	}
+}
+
+func isRemoteTrackEnd(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+func (writer *RTPTrackWriter) authoritativeCloseBoundary() (int64, bool) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.closeAtMS == nil {
+		return 0, false
+	}
+	return *writer.closeAtMS, true
 }
 
 func (writer *RTPTrackWriter) processClosedSegment(

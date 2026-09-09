@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"sync"
 	"time"
@@ -24,6 +25,10 @@ type RecoveryDiscoveryControlPlane interface {
 	RecoverCurrent(context.Context, string, string, string) (RecoveryState, error)
 }
 
+type CaptureFailureControlPlane interface {
+	Fail(context.Context, CaptureFence, string, string) error
+}
+
 type CapturePeer interface {
 	signaling.PeerSession
 	Tracks() <-chan signaling.TrackEvent
@@ -42,9 +47,11 @@ type CaptureRunnerDependencies struct {
 	FinalizeTimeout          time.Duration
 	MaximumStorageBytes      int64
 	MaximumCaptureDuration   time.Duration
+	MediaStartupTimeout      time.Duration
 	SegmentOperationTimeout  time.Duration
 	MaximumConcurrentUploads int
 	Now                      func() time.Time
+	newPacketWriter          packetWriterFactory
 }
 
 type CaptureAttemptRunner struct {
@@ -66,6 +73,9 @@ func NewCaptureAttemptRunner(dependencies CaptureRunnerDependencies) (*CaptureAt
 	if dependencies.SegmentOperationTimeout == 0 {
 		dependencies.SegmentOperationTimeout = dependencies.FinalizeTimeout
 	}
+	if dependencies.MediaStartupTimeout == 0 {
+		dependencies.MediaStartupTimeout = dependencies.FinalizeTimeout
+	}
 	if dependencies.MaximumConcurrentUploads == 0 {
 		dependencies.MaximumConcurrentUploads = 4
 	}
@@ -77,7 +87,8 @@ func NewCaptureAttemptRunner(dependencies CaptureRunnerDependencies) (*CaptureAt
 	invalidMaximumDuration := dependencies.MaximumCaptureDuration < time.Second ||
 		dependencies.MaximumCaptureDuration > 24*time.Hour
 	if missingDependency || dependencies.StorageRoot == "" || invalidSegmentDuration ||
-		dependencies.FinalizeTimeout <= 0 || dependencies.SegmentOperationTimeout <= 0 ||
+		dependencies.FinalizeTimeout <= 0 || dependencies.MediaStartupTimeout <= 0 ||
+		dependencies.SegmentOperationTimeout <= 0 ||
 		dependencies.MaximumConcurrentUploads < 1 || dependencies.MaximumConcurrentUploads > 32 ||
 		dependencies.MaximumStorageBytes < 1 || invalidMaximumDuration {
 		return nil, errors.New("invalid capture attempt runner dependencies")
@@ -133,6 +144,7 @@ func (runner *CaptureAttemptRunner) Run(
 		AttemptID: request.AttemptID, RecordingID: request.RecordingID,
 		WorkerID: request.WorkerID, WorkerGenerationID: request.WorkerGenerationID,
 	}
+	spoolFence := newSpoolMutationFence(attemptFence, request.CaptureGeneration)
 	manifest, err := runner.dependencies.Spool.Begin(
 		ctx,
 		attemptFence,
@@ -143,10 +155,10 @@ func (runner *CaptureAttemptRunner) Run(
 	if err != nil {
 		return err
 	}
-	if err := runner.dependencies.Spool.CleanupStaging(request.RecordingID); err != nil {
+	if err := runner.dependencies.Spool.CleanupStaging(spoolFence); err != nil {
 		return err
 	}
-	defer runner.dependencies.Spool.CleanupStaging(request.RecordingID)
+	defer runner.dependencies.Spool.CleanupStaging(spoolFence)
 	timeline, err := NewTimelineState(request.RecordingID)
 	if err != nil {
 		return err
@@ -167,7 +179,7 @@ func (runner *CaptureAttemptRunner) Run(
 			return recordsErr
 		}
 		if err := runner.dependencies.Spool.ReconcileCheckpoint(
-			request.RecordingID,
+			spoolFence,
 			checkpoint,
 			records,
 		); err != nil {
@@ -179,7 +191,7 @@ func (runner *CaptureAttemptRunner) Run(
 		}
 	}
 	session := &captureSession{
-		runner: runner, fence: fence, timeline: timeline, startedAt: startedAt,
+		runner: runner, fence: fence, spoolFence: spoolFence, timeline: timeline, startedAt: startedAt,
 		checkpointSequence: nextCheckpointSequence(recovery.GenerationCheckpoints, fence.CaptureGeneration),
 		writers:            map[string]*RTPTrackWriter{}, trackInputs: map[string]signaling.TrackEvent{},
 		sequences:    recoveredSequences(recovery, manifest, fence.CaptureGeneration),
@@ -187,9 +199,11 @@ func (runner *CaptureAttemptRunner) Run(
 	}
 	if checkpoint, exists := latestCheckpoint(recovery.GenerationCheckpoints); exists {
 		session.checkpointBoundary = checkpoint.TimelineThroughMS
-		if err := timeline.DeclareRecoveryGaps(checkpoint.TimelineThroughMS, session.timelineMS()); err != nil {
+		recoveryBoundaryMS := session.timelineMS()
+		if err := timeline.DeclareRecoveryGaps(checkpoint.TimelineThroughMS, recoveryBoundaryMS); err != nil {
 			return err
 		}
+		session.coverageFloorMS = recoveryBoundaryMS
 	}
 	signalingClient, err := runner.dependencies.Dial(
 		ctx,
@@ -211,58 +225,113 @@ func (runner *CaptureAttemptRunner) Run(
 		return err
 	}
 	defer controller.Close()
+	captureContext := context.WithoutCancel(ctx)
+	failAndSeal := func(cause error) error {
+		cancelRun()
+		return session.failAndSeal(errors.Join(cause, controller.Close()))
+	}
 	lifecycle := make(chan error, 1)
-	go func() { lifecycle <- controller.Run(ctx) }()
+	go func() { lifecycle <- controller.Run(captureContext) }()
 	resumeContext, cancelResume := context.WithCancel(ctx)
 	defer cancelResume()
 	resume := make(chan error, 1)
 	go func() { resume <- session.resumePending(resumeContext, manifest) }()
+	pendingInitialTracks := activeProducerIDs(controller.State().Producers)
+	var mediaStartupTimer *time.Timer
+	var mediaStartupDeadline <-chan time.Time
+	if len(pendingInitialTracks) > 0 {
+		mediaStartupTimer = time.NewTimer(runner.dependencies.MediaStartupTimeout)
+		mediaStartupDeadline = mediaStartupTimer.C
+		defer mediaStartupTimer.Stop()
+	}
+	recoveryPending := true
+	readyReported := false
+	reportReady := func() {
+		if readyReported || recoveryPending || len(pendingInitialTracks) != 0 {
+			return
+		}
+		readyReported = controller.WhileActive(ctx, ready)
+		if readyReported && mediaStartupTimer != nil {
+			mediaStartupTimer.Stop()
+			mediaStartupDeadline = nil
+		}
+	}
 	for {
 		select {
 		case resumeErr := <-resume:
 			resume = nil
+			recoveryPending = false
 			if resumeErr != nil {
 				if ctx.Err() != nil {
-					return session.cleanStop()
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						return failAndSeal(errors.Join(
+							ErrCaptureMaximumDuration,
+							resumeErr,
+						))
+					}
+					return errors.Join(controller.Close(), session.cleanStop())
 				}
-				cancelRun()
-				return session.failAndSeal(resumeErr)
+				return failAndSeal(resumeErr)
 			}
-			controller.WhileActive(ctx, ready)
+			reportReady()
 		case event, open := <-peer.Tracks():
 			if !open {
-				cancelRun()
 				resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
-				return session.failAndSeal(errors.Join(errors.New("Pion track channel closed"), resumeErr))
+				return failAndSeal(errors.Join(errors.New("Pion track channel closed"), resumeErr))
 			}
-			if err := session.startTrack(ctx, event); err != nil {
-				cancelRun()
+			if err := session.startTrack(captureContext, event); err != nil {
 				resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
-				return session.failAndSeal(errors.Join(err, resumeErr))
+				return failAndSeal(errors.Join(err, resumeErr))
 			}
+			delete(pendingInitialTracks, event.ProducerID)
+			reportReady()
 			report(ProbeEvidence{ObservedSources: []signaling.Source{event.Source}, Codecs: []string{event.Codec}})
+		case <-mediaStartupDeadline:
+			pendingInitialTracks = retainActiveProducers(
+				pendingInitialTracks,
+				controller.State().Producers,
+			)
+			if len(pendingInitialTracks) == 0 {
+				mediaStartupDeadline = nil
+				reportReady()
+				continue
+			}
+			resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
+			return failAndSeal(errors.Join(ErrCaptureMediaUnavailable, resumeErr))
 		case peerErr, open := <-peer.Errors():
 			if !open || peerErr == nil {
 				peerErr = errors.New("Pion error channel closed")
 			}
-			cancelRun()
 			resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
-			return session.failAndSeal(errors.Join(peerErr, resumeErr))
+			return failAndSeal(errors.Join(peerErr, resumeErr))
 		case failure := <-session.writerErrors:
 			if session.acceptWriterFailure(failure) {
-				cancelRun()
 				resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
-				return session.failAndSeal(errors.Join(failure.err, resumeErr))
+				return failAndSeal(errors.Join(failure.err, resumeErr))
 			}
 		case lifecycleErr := <-lifecycle:
 			if errors.Is(lifecycleErr, signaling.ErrAuthoritativeStop) {
-				stopBoundary := session.nextTimelinePoint()
-				writers := session.stopWritersAt(stopBoundary)
-				controllerErr := controller.Close()
 				finalContext, cancelFinal := context.WithTimeout(
 					context.Background(),
 					runner.dependencies.FinalizeTimeout,
 				)
+				recovery, recoveryErr := session.waitForTerminalRecovery(finalContext)
+				if recoveryErr != nil || recovery.TerminalTimelineEnd == nil {
+					cancelFinal()
+					resumeErr := stopPendingResume(
+						cancelResume,
+						resume,
+						runner.dependencies.FinalizeTimeout,
+					)
+					return failAndSeal(errors.Join(
+						ErrFinalizationFailed,
+						recoveryErr,
+						resumeErr,
+					))
+				}
+				terminalEnd := *recovery.TerminalTimelineEnd
+				writers := session.stopWritersAt(terminalEnd)
+				controllerErr := controller.Close()
 				writersErr := session.waitWriters(finalContext, writers)
 				if writersErr != nil {
 					cancelFinal()
@@ -278,9 +347,8 @@ func (runner *CaptureAttemptRunner) Run(
 					}
 					return session.failAndSeal(cause)
 				}
-				checkpointErr := session.checkpoint(finalContext, stopBoundary, false)
 				cancelFinal()
-				if controllerErr != nil || checkpointErr != nil {
+				if controllerErr != nil {
 					cancelRun()
 					resumeErr := stopPendingResume(
 						cancelResume,
@@ -290,7 +358,6 @@ func (runner *CaptureAttemptRunner) Run(
 					return session.failAndSeal(errors.Join(
 						ErrFinalizationFailed,
 						controllerErr,
-						checkpointErr,
 						resumeErr,
 					))
 				}
@@ -306,21 +373,58 @@ func (runner *CaptureAttemptRunner) Run(
 					return session.failAndSeal(errors.Join(ErrFinalizationFailed, resumeErr))
 				}
 				resume = nil
-				if err := session.finishCleanStop(); err != nil {
+				if err := session.finishCleanStopWithRecovery(recovery); err != nil {
 					return fmt.Errorf("%w: %v", ErrFinalizationFailed, err)
 				}
 				return signaling.ErrAuthoritativeStop
 			}
 			resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
 			if ctx.Err() == nil {
-				return session.failAndSeal(errors.Join(lifecycleErr, resumeErr))
+				return failAndSeal(errors.Join(lifecycleErr, resumeErr))
 			}
-			return errors.Join(session.cleanStop(), resumeErr)
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return failAndSeal(errors.Join(
+					ErrCaptureMaximumDuration,
+					lifecycleErr,
+					resumeErr,
+				))
+			}
+			return errors.Join(controller.Close(), session.cleanStop(), resumeErr)
 		case <-ctx.Done():
 			resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
-			return errors.Join(session.cleanStop(), resumeErr)
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return failAndSeal(errors.Join(ErrCaptureMaximumDuration, resumeErr))
+			}
+			controllerErr := controller.Close()
+			if stopErr := session.cleanStop(); stopErr != nil {
+				return errors.Join(ErrFinalizationFailed, controllerErr, stopErr, resumeErr)
+			}
+			return errors.Join(controllerErr, resumeErr)
 		}
 	}
+}
+
+func activeProducerIDs(producers []signaling.Producer) map[string]struct{} {
+	result := make(map[string]struct{}, len(producers))
+	for _, producer := range producers {
+		if !producer.Paused {
+			result[producer.ProducerID] = struct{}{}
+		}
+	}
+	return result
+}
+
+func retainActiveProducers(
+	pending map[string]struct{},
+	producers []signaling.Producer,
+) map[string]struct{} {
+	active := activeProducerIDs(producers)
+	for producerID := range pending {
+		if _, exists := active[producerID]; !exists {
+			delete(pending, producerID)
+		}
+	}
+	return pending
 }
 
 func awaitPendingResume(result <-chan error, timeout time.Duration) (bool, error) {
@@ -385,6 +489,7 @@ func (runner *CaptureAttemptRunner) Finalize(ctx context.Context, request Finali
 		AttemptID: request.AttemptID, RecordingID: request.RecordingID,
 		WorkerID: request.WorkerID, WorkerGenerationID: request.WorkerGenerationID,
 	}
+	spoolFence := newSpoolMutationFence(attemptFence, recovery.CaptureGeneration)
 	if _, err := runner.dependencies.Spool.Begin(
 		ctx,
 		attemptFence,
@@ -401,25 +506,68 @@ func (runner *CaptureAttemptRunner) Finalize(ctx context.Context, request Finali
 	if err := timeline.Restore(recovery); err != nil {
 		return err
 	}
+	terminalEnd := *recovery.TerminalTimelineEnd
 	checkpoint, exists := latestCheckpoint(recovery.GenerationCheckpoints)
 	if !exists {
-		return errors.New("seal-only recovery has no checkpoint")
+		failureAPI, supportsFailure := runner.dependencies.API.(CaptureFailureControlPlane)
+		if !supportsFailure {
+			return errors.New("seal-only recovery has no checkpoint")
+		}
+		if err := failureAPI.Fail(
+			ctx,
+			fence,
+			"BOT_CAPTURE_INCOMPLETE",
+			"Capture ended before any durable timeline checkpoint",
+		); err != nil {
+			return fmt.Errorf("persist empty terminal capture failure: %w", err)
+		}
+		return runner.dependencies.Spool.MarkFailed(spoolFence)
+	}
+	if checkpoint.TimelineThroughMS > terminalEnd {
+		return errors.New("seal-only checkpoint exceeds terminal timeline")
+	}
+	if checkpoint.CaptureGeneration == recovery.CaptureGeneration {
+		checkpointRecords, recordsErr := timeline.RecordsThrough(checkpoint.TimelineThroughMS, false)
+		if recordsErr != nil {
+			return recordsErr
+		}
+		if err := runner.dependencies.Spool.ReconcileCheckpoint(
+			spoolFence,
+			checkpoint,
+			checkpointRecords,
+		); err != nil {
+			return err
+		}
 	}
 	_, err = runner.dependencies.API.Seal(ctx, fence, SealRequest{
-		Completeness: "partial", TimelineEndMS: *recovery.TerminalTimelineEnd,
+		Completeness: "partial", TimelineEndMS: terminalEnd,
 		LastCheckpointCaptureGeneration: checkpoint.CaptureGeneration,
 		LastCheckpointSequence:          checkpoint.CheckpointSequence,
 		CheckpointPayloadSHA256:         checkpoint.PayloadSHA256,
 	})
 	if err != nil {
+		var failure *CaptureAPIError
+		failureAPI, supportsFailure := runner.dependencies.API.(CaptureFailureControlPlane)
+		if errors.As(err, &failure) && failure.Code == "CAPTURE_MANIFEST_CONFLICT" && supportsFailure {
+			if failErr := failureAPI.Fail(
+				ctx,
+				fence,
+				"BOT_CAPTURE_INCOMPLETE",
+				"Capture manifest failed validation",
+			); failErr != nil {
+				return fmt.Errorf("persist terminal capture failure: %w", failErr)
+			}
+			return runner.dependencies.Spool.MarkFailed(spoolFence)
+		}
 		return err
 	}
-	return runner.dependencies.Spool.MarkSealed(request.RecordingID)
+	return runner.dependencies.Spool.MarkSealed(spoolFence)
 }
 
 type captureSession struct {
 	runner             *CaptureAttemptRunner
 	fence              CaptureFence
+	spoolFence         SpoolMutationFence
 	timeline           *TimelineState
 	startedAt          time.Time
 	mu                 sync.Mutex
@@ -428,7 +576,10 @@ type captureSession struct {
 	checkpointMu       sync.Mutex
 	checkpointSequence int32
 	checkpointBoundary int64
+	coverageFloorMS    int64
 	writers            map[string]*RTPTrackWriter
+	startingWriters    map[string]struct{}
+	writerHandoffs     map[string]int64
 	trackInputs        map[string]signaling.TrackEvent
 	sequences          map[string]int32
 	writerErrors       chan trackWriterFailure
@@ -439,6 +590,34 @@ type trackWriterFailure struct {
 	trackID string
 	writer  *RTPTrackWriter
 	err     error
+}
+
+type fencedStagingBudget struct {
+	spool *DurableSpool
+	fence SpoolMutationFence
+}
+
+func (budget fencedStagingBudget) ResizeStaging(recordingID, path string, size int64) error {
+	if recordingID != budget.fence.RecordingID {
+		return ErrAttemptFenceMismatch
+	}
+	return budget.spool.ResizeStaging(budget.fence, path, size)
+}
+
+func (budget fencedStagingBudget) ReleaseStaging(recordingID, path string) {
+	if recordingID == budget.fence.RecordingID {
+		budget.spool.ReleaseStaging(budget.fence, path)
+	}
+}
+
+func newSpoolMutationFence(fence AttemptFence, captureGeneration int32) SpoolMutationFence {
+	return SpoolMutationFence{
+		AttemptID:          fence.AttemptID,
+		RecordingID:        fence.RecordingID,
+		WorkerID:           fence.WorkerID,
+		WorkerGenerationID: fence.WorkerGenerationID,
+		CaptureGeneration:  captureGeneration,
+	}
 }
 
 func (session *captureSession) Snapshot(ctx context.Context, snapshot signaling.Snapshot) error {
@@ -453,6 +632,14 @@ func (session *captureSession) Snapshot(ctx context.Context, snapshot signaling.
 	}
 	if err := session.timeline.ApplySnapshot(snapshot, now); err != nil {
 		return err
+	}
+	for _, producer := range snapshot.Producers {
+		if producer.Paused {
+			continue
+		}
+		if err := session.beginTrackCoverage(producer.ProducerID); err != nil {
+			return err
+		}
 	}
 	if err := session.checkpoint(ctx, now, false); err != nil {
 		return err
@@ -474,6 +661,13 @@ func (session *captureSession) Event(ctx context.Context, event signaling.Event)
 	if err := session.timeline.ApplyEvent(event, now); err != nil {
 		return err
 	}
+	if event.Type == "bot:producerAdded" ||
+		(event.Type == "bot:producerUpdated" && event.Producer != nil && !event.Producer.Paused) ||
+		event.Type == "bot:producerResumed" {
+		if err := session.beginTrackCoverage(eventProducerID(event)); err != nil {
+			return err
+		}
+	}
 	if err := session.checkpoint(ctx, now, false); err != nil {
 		return err
 	}
@@ -485,6 +679,11 @@ func (session *captureSession) Event(ctx context.Context, event signaling.Event)
 }
 
 func (session *captureSession) startTrack(ctx context.Context, event signaling.TrackEvent) error {
+	session.observerMu.Lock()
+	defer session.observerMu.Unlock()
+	if session.isStopping() {
+		return errCaptureSessionStopping
+	}
 	if event.SourceTrack == nil {
 		return errors.New("remote track source is absent")
 	}
@@ -497,6 +696,31 @@ func (session *captureSession) startTrack(ctx context.Context, event signaling.T
 	return session.startTrackInput(ctx, event)
 }
 
+func (session *captureSession) beginTrackCoverage(producerID string) error {
+	trackID, _, exists := session.timeline.TrackForProducer(producerID)
+	if !exists {
+		return errors.New("producer has no active timeline track")
+	}
+	coverageStartMS, exists := session.timeline.ActiveTrackStart(trackID)
+	if !exists {
+		return errors.New("remote track has no active timeline interval")
+	}
+	session.mu.Lock()
+	_, writerStarting := session.startingWriters[trackID]
+	writerExists := session.writers[trackID] != nil || writerStarting
+	if session.coverageFloorMS > coverageStartMS {
+		coverageStartMS = session.coverageFloorMS
+	}
+	if handoffMS, handedOff := session.writerHandoffs[trackID]; handedOff && handoffMS > coverageStartMS {
+		coverageStartMS = handoffMS
+	}
+	session.mu.Unlock()
+	if writerExists {
+		return nil
+	}
+	return session.timeline.BeginTrackCoverage(trackID, coverageStartMS)
+}
+
 func (session *captureSession) startTrackInput(ctx context.Context, event signaling.TrackEvent) error {
 	session.writerMu.Lock()
 	defer session.writerMu.Unlock()
@@ -507,25 +731,60 @@ func (session *captureSession) startTrackInput(ctx context.Context, event signal
 	if !exists || event.SourceTrack == nil {
 		return errors.New("remote track has no authoritative timeline identity")
 	}
+	coverageStartMS, exists := session.timeline.ActiveTrackStart(trackID)
+	if !exists {
+		return errors.New("remote track has no active timeline interval")
+	}
+	if session.coverageFloorMS > coverageStartMS {
+		coverageStartMS = session.coverageFloorMS
+	}
 	session.mu.Lock()
 	previous := session.writers[trackID]
+	if handoffMS, handedOff := session.writerHandoffs[trackID]; handedOff && handoffMS > coverageStartMS {
+		coverageStartMS = handoffMS
+	}
 	if session.writerErrors == nil {
 		session.writerErrors = make(chan trackWriterFailure, 32)
 	}
 	session.mu.Unlock()
 	if previous != nil {
+		handoffMS := session.nextTimelinePoint()
 		closeContext, cancel := context.WithTimeout(context.Background(), session.runner.dependencies.FinalizeTimeout)
-		err := previous.CloseAt(closeContext, session.nextTimelinePoint())
+		err := previous.CloseAt(closeContext, handoffMS)
 		cancel()
 		if err != nil {
 			return err
 		}
+		coverageStartMS = handoffMS
+	}
+	session.mu.Lock()
+	if session.startingWriters == nil {
+		session.startingWriters = map[string]struct{}{}
+	}
+	session.startingWriters[trackID] = struct{}{}
+	session.mu.Unlock()
+	writerRegistered := false
+	defer func() {
+		if writerRegistered {
+			return
+		}
+		session.mu.Lock()
+		delete(session.startingWriters, trackID)
+		session.mu.Unlock()
+	}()
+	if err := session.timeline.BeginTrackCoverage(trackID, coverageStartMS); err != nil {
+		return err
 	}
 	session.mu.Lock()
 	initialSequence := session.sequences[trackID]
 	session.mu.Unlock()
 	if err := event.SourceTrack.SetReadDeadline(time.Time{}); err != nil {
-		return errors.New("reset remote track read deadline")
+		resolveErr := session.timeline.ResolveTrackCoverage(
+			trackID,
+			coverageStartMS,
+			max(coverageStartMS, session.timelineMS()),
+		)
+		return errors.Join(errors.New("reset remote track read deadline"), resolveErr)
 	}
 	writer, err := StartRTPTrackWriter(ctx, RTPTrackWriterConfig{
 		Track: event.SourceTrack, ParticipantInstanceID: participantID,
@@ -539,18 +798,30 @@ func (session *captureSession) startTrackInput(ctx context.Context, event signal
 		SegmentDuration:        session.runner.dependencies.SegmentDuration,
 		MaximumSegmentDuration: session.runner.dependencies.MaximumSegmentDuration,
 		TimelineClock:          session.timelineMS, Muxer: session.runner.dependencies.Muxer,
+		CoverageStartMS: coverageStartMS,
+		OnInitialGap: func(startMS, endMS int64) error {
+			return session.timeline.ResolveTrackCoverage(trackID, startMS, endMS)
+		},
 		InitialSequence:     initialSequence,
 		OperationTimeout:    session.runner.dependencies.SegmentOperationTimeout,
 		MaximumStorageBytes: session.runner.dependencies.MaximumStorageBytes,
 		RecordingID:         session.fence.RecordingID,
-		StagingBudget:       session.runner.dependencies.Spool,
-		OnSegment:           session.segmentReady,
+		StagingBudget: fencedStagingBudget{
+			spool: session.runner.dependencies.Spool,
+			fence: session.spoolFence,
+		},
+		OnSegment:       session.segmentReady,
+		newPacketWriter: session.runner.dependencies.newPacketWriter,
 	})
 	if err != nil {
-		return err
+		resolveErr := session.timeline.ResolveTrackCoverage(trackID, coverageStartMS, max(coverageStartMS, session.timelineMS()))
+		return errors.Join(err, resolveErr)
 	}
 	session.mu.Lock()
 	session.writers[trackID] = writer
+	delete(session.startingWriters, trackID)
+	delete(session.writerHandoffs, trackID)
+	writerRegistered = true
 	session.mu.Unlock()
 	go session.observeWriter(ctx, trackID, writer)
 	return nil
@@ -587,8 +858,18 @@ func (session *captureSession) closeTrackBarriers(ctx context.Context, trackIDs 
 		session.mu.Lock()
 		writer := session.writers[trackID]
 		delete(session.writers, trackID)
+		if writer != nil {
+			if session.writerHandoffs == nil {
+				session.writerHandoffs = map[string]int64{}
+			}
+			session.writerHandoffs[trackID] = atMS
+		}
 		session.mu.Unlock()
 		if writer == nil {
+			if err := session.timeline.ResolvePendingTrackCoverage(trackID, atMS); err != nil {
+				session.writerMu.Unlock()
+				return err
+			}
 			continue
 		}
 		writer.stop(&atMS)
@@ -688,7 +969,7 @@ func (session *captureSession) segmentReady(
 ) error {
 	stored, err := session.runner.dependencies.Spool.StoreSegment(
 		ctx,
-		session.fence.RecordingID,
+		session.spoolFence,
 		descriptor,
 		stagingPath,
 	)
@@ -698,13 +979,17 @@ func (session *captureSession) segmentReady(
 	if err != nil {
 		return err
 	}
-	if err := session.checkpoint(ctx, descriptor.EndMS, false); err != nil {
+	uploadReady, err := session.checkpointBeforeUpload(ctx, descriptor.EndMS)
+	if err != nil {
 		return err
+	}
+	if !uploadReady {
+		return nil
 	}
 	if err := session.upload(ctx, stored); err != nil {
 		return err
 	}
-	return session.runner.dependencies.Spool.RemoveCommitted(session.fence.RecordingID)
+	return session.runner.dependencies.Spool.RemoveCommitted(session.spoolFence)
 }
 
 func (session *captureSession) reserveSequence(trackID string, sequence int32) {
@@ -743,8 +1028,7 @@ func (session *captureSession) upload(ctx context.Context, segment DurableSegmen
 		return err
 	}
 	return session.runner.dependencies.Spool.MarkCommitted(
-		session.fence.RecordingID,
-		segment.CaptureGeneration,
+		session.spoolFence,
 		segment.TrackID,
 		segment.Sequence,
 		targets[0].UploadID,
@@ -756,14 +1040,39 @@ func (session *captureSession) resumePending(ctx context.Context, manifest *Spoo
 		if segment.Committed {
 			continue
 		}
-		if err := session.checkpoint(ctx, segment.EndMS, false); err != nil {
+		uploadReady, err := session.checkpointBeforeUpload(ctx, segment.EndMS)
+		if err != nil {
 			return err
+		}
+		if !uploadReady {
+			continue
 		}
 		if err := session.upload(ctx, segment); err != nil {
 			return err
 		}
 	}
-	return session.runner.dependencies.Spool.RemoveCommitted(session.fence.RecordingID)
+	return session.runner.dependencies.Spool.RemoveCommitted(session.spoolFence)
+}
+
+func (session *captureSession) checkpointBeforeUpload(ctx context.Context, throughMS int64) (bool, error) {
+	err := session.checkpoint(ctx, throughMS, false)
+	var failure *CaptureAPIError
+	if !errors.As(err, &failure) || failure.Status != http.StatusConflict ||
+		failure.Code != "TERMINAL_TIMELINE_CONFLICT" {
+		return err == nil, err
+	}
+	// close-inputs can publish the terminal fence while an already closed
+	// segment is being processed. Keep it in the durable spool until every
+	// writer and lifecycle input has drained; finalization then publishes one
+	// stable terminal checkpoint before resuming the upload.
+	recovery, recoveryErr := session.runner.dependencies.API.Recover(ctx, session.fence)
+	if recoveryErr != nil {
+		return false, errors.Join(err, recoveryErr)
+	}
+	if recovery.TerminalTimelineEnd == nil || throughMS > *recovery.TerminalTimelineEnd {
+		return false, err
+	}
+	return false, nil
 }
 
 func (session *captureSession) checkpoint(ctx context.Context, throughMS int64, closeOpen bool) error {
@@ -809,7 +1118,7 @@ func (session *captureSession) checkpoint(ctx context.Context, throughMS int64, 
 		PayloadSHA256:      result.PayloadSHA256,
 	}
 	if err := session.runner.dependencies.Spool.StoreCheckpoint(
-		session.fence.RecordingID,
+		session.spoolFence,
 		checkpoint,
 		records,
 	); err != nil {
@@ -823,10 +1132,20 @@ func (session *captureSession) checkpoint(ctx context.Context, throughMS int64, 
 }
 
 func (session *captureSession) cleanStop() error {
-	if err := session.prepareCleanStop(); err != nil {
+	finalContext, cancel := context.WithTimeout(context.Background(), session.runner.dependencies.FinalizeTimeout)
+	defer cancel()
+	recovery, err := session.waitForTerminalRecovery(finalContext)
+	if err != nil {
 		return err
 	}
-	return session.finishCleanStop()
+	if recovery.TerminalTimelineEnd == nil {
+		return errors.New("clean stop has no authoritative terminal timeline")
+	}
+	end := *recovery.TerminalTimelineEnd
+	if err := session.closeWritersAt(finalContext, end); err != nil {
+		return err
+	}
+	return session.finishCleanStopWithRecovery(recovery)
 }
 
 func (session *captureSession) prepareCleanStop() error {
@@ -846,14 +1165,31 @@ func (session *captureSession) finishCleanStop() error {
 	if err != nil {
 		return err
 	}
+	return session.finishCleanStopWithRecovery(recovery)
+}
+
+func (session *captureSession) finishCleanStopWithRecovery(recovery RecoveryState) error {
 	if recovery.TerminalTimelineEnd == nil {
 		return errors.New("clean stop has no authoritative terminal timeline")
 	}
 	end := *recovery.TerminalTimelineEnd
+	checkpointBoundary := session.currentCheckpointBoundary()
+	if end < checkpointBoundary {
+		return errors.New("authoritative terminal timeline regressed local checkpoint")
+	}
+	finalContext, cancel := context.WithTimeout(context.Background(), session.runner.dependencies.FinalizeTimeout)
+	defer cancel()
 	if err := session.checkpoint(finalContext, end, true); err != nil {
 		return err
 	}
 	manifest, err := session.runner.dependencies.Spool.Snapshot(session.fence.RecordingID)
+	if err != nil {
+		return err
+	}
+	if err := session.resumePending(finalContext, manifest); err != nil {
+		return err
+	}
+	manifest, err = session.runner.dependencies.Spool.Snapshot(session.fence.RecordingID)
 	if err != nil {
 		return err
 	}
@@ -870,7 +1206,7 @@ func (session *captureSession) finishCleanStop() error {
 	if err != nil {
 		return err
 	}
-	return session.runner.dependencies.Spool.MarkSealed(session.fence.RecordingID)
+	return session.runner.dependencies.Spool.MarkSealed(session.spoolFence)
 }
 
 func (session *captureSession) waitForTerminalRecovery(ctx context.Context) (RecoveryState, error) {
@@ -905,11 +1241,26 @@ func (session *captureSession) waitForTerminalRecovery(ctx context.Context) (Rec
 func (session *captureSession) failAndSeal(cause error) error {
 	finalContext, cancel := context.WithTimeout(context.Background(), session.runner.dependencies.FinalizeTimeout)
 	defer cancel()
-	closeErr := session.closeWriters(finalContext)
+	recovery, recoveryErr := session.runner.dependencies.API.Recover(finalContext, session.fence)
+	var closeErr error
+	if recoveryErr == nil && recovery.TerminalTimelineEnd != nil {
+		if err := validateRecoveryDuration(
+			recovery,
+			session.runner.dependencies.MaximumCaptureDuration,
+		); err != nil {
+			closeErr = session.closeWriters(finalContext)
+			return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
+		}
+		closeErr = session.closeWritersAt(finalContext, *recovery.TerminalTimelineEnd)
+	} else {
+		closeErr = session.closeWriters(finalContext)
+	}
 	if errors.Is(closeErr, errTrackWriterStillRunning) {
 		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr)
 	}
-	recovery, recoveryErr := session.runner.dependencies.API.Recover(finalContext, session.fence)
+	if recoveryErr == nil && recovery.TerminalTimelineEnd == nil {
+		recovery, recoveryErr = session.waitForTerminalRecovery(finalContext)
+	}
 	if recoveryErr != nil || recovery.TerminalTimelineEnd == nil {
 		if recoveryErr == nil {
 			recoveryErr = errors.New("partial seal has no authoritative terminal timeline")
@@ -929,24 +1280,41 @@ func (session *captureSession) failAndSeal(cause error) error {
 		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
 	}
 	end := *recovery.TerminalTimelineEnd
-	checkpoint, exists := latestCheckpoint(recovery.GenerationCheckpoints)
-	if !exists {
+	checkpointBoundary := session.currentCheckpointBoundary()
+	if end < checkpointBoundary {
 		return errors.Join(
 			ErrCaptureIncomplete,
 			ErrFinalizationFailed,
 			cause,
 			closeErr,
-			errors.New("partial seal has no durable checkpoint"),
+			errors.New("authoritative terminal timeline regressed local checkpoint"),
 		)
+	}
+	if err := session.timeline.DeclareRecoveryGaps(checkpointBoundary, end); err != nil {
+		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
+	}
+	if err := session.checkpoint(finalContext, end, true); err != nil {
+		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
+	}
+	manifest, err := session.runner.dependencies.Spool.Snapshot(session.fence.RecordingID)
+	if err != nil {
+		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
+	}
+	if err := session.resumePending(finalContext, manifest); err != nil {
+		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
+	}
+	manifest, err = session.runner.dependencies.Spool.Snapshot(session.fence.RecordingID)
+	if err != nil {
+		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
 	}
 	_, sealErr := session.runner.dependencies.API.Seal(finalContext, session.fence, SealRequest{
 		Completeness: "partial", TimelineEndMS: end,
-		LastCheckpointCaptureGeneration: checkpoint.CaptureGeneration,
-		LastCheckpointSequence:          checkpoint.CheckpointSequence,
-		CheckpointPayloadSHA256:         checkpoint.PayloadSHA256,
+		LastCheckpointCaptureGeneration: session.fence.CaptureGeneration,
+		LastCheckpointSequence:          manifest.LastCheckpointSequence,
+		CheckpointPayloadSHA256:         manifest.LastCheckpointHash,
 	})
 	if sealErr == nil {
-		sealErr = session.runner.dependencies.Spool.MarkSealed(session.fence.RecordingID)
+		sealErr = session.runner.dependencies.Spool.MarkSealed(session.spoolFence)
 	}
 	result := errors.Join(ErrCaptureIncomplete, cause, closeErr)
 	if sealErr != nil {
@@ -1021,6 +1389,12 @@ func (session *captureSession) maximumTimelineMS() int64 {
 	return session.runner.dependencies.MaximumCaptureDuration.Milliseconds()
 }
 
+func (session *captureSession) currentCheckpointBoundary() int64 {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.checkpointBoundary
+}
+
 func (session *captureSession) nextTimelinePoint() int64 {
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -1092,6 +1466,7 @@ func NewProductionCaptureRunner(
 		SegmentOperationTimeout:  max(config.RecoveryTimeout, config.MaxInFlightPUT+30*time.Second),
 		MaximumConcurrentUploads: min(8, max(2, config.MaxSlots)),
 		MaximumCaptureDuration:   config.MaxDuration,
+		MediaStartupTimeout:      config.StartTimeout,
 		Now:                      time.Now,
 	})
 }
@@ -1099,8 +1474,9 @@ func NewProductionCaptureRunner(
 var ErrCaptureMaximumDuration = errors.New("capture maximum duration reached")
 
 var (
-	ErrCaptureIncomplete  = errors.New("capture incomplete")
-	ErrFinalizationFailed = errors.New("capture finalization failed")
+	ErrCaptureIncomplete       = errors.New("capture incomplete")
+	ErrCaptureMediaUnavailable = errors.New("active producer media did not reach capture")
+	ErrFinalizationFailed      = errors.New("capture finalization failed")
 )
 
 func validateRecoveryDuration(recovery RecoveryState, maximum time.Duration) error {

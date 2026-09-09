@@ -150,6 +150,40 @@ func TestCaptureV2RetriesTransientFailuresButNotStaleFence(t *testing.T) {
 	}
 }
 
+func TestCaptureV2FailUsesTheFencedProtocolRoute(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/internal/v1/recordings/rec-1/capture-v2/fail" ||
+			request.Header.Get("X-Recording-Worker-Id") != "worker-1" ||
+			request.Header.Get("X-Recording-Worker-Generation-Id") != "process-1" {
+			http.Error(response, "missing fence", http.StatusBadRequest)
+			return
+		}
+		var body struct {
+			ProtocolVersion   string `json:"protocolVersion"`
+			CaptureGeneration int32  `json:"captureGeneration"`
+			Code              string `json:"code"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil ||
+			body.ProtocolVersion != CaptureProtocolVersion || body.CaptureGeneration != 3 ||
+			body.Code != "BOT_CAPTURE_INCOMPLETE" {
+			http.Error(response, "invalid failure", http.StatusBadRequest)
+			return
+		}
+		writeJSON(response, http.StatusOK, map[string]bool{"failed": true})
+	}))
+	defer server.Close()
+
+	client := testCaptureClient(t, server.URL)
+	if err := client.Fail(
+		context.Background(),
+		CaptureFence{"rec-1", "worker-1", "process-1", 3},
+		"BOT_CAPTURE_INCOMPLETE",
+		"Capture manifest failed validation",
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptureV2RecoveryRestartsExpiredCursorAndLoadsAllPages(t *testing.T) {
 	firstRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {

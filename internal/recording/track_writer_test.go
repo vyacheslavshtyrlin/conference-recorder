@@ -17,6 +17,29 @@ type trackFixture struct {
 	mu      sync.Mutex
 	packets []*rtp.Packet
 	release chan struct{}
+	eof     chan struct{}
+	readErr error
+}
+
+type remoteTrackTimeout struct{}
+
+func (remoteTrackTimeout) Error() string { return "i/o timeout" }
+func (remoteTrackTimeout) Timeout() bool { return true }
+
+type packetAfterDeadlineTrack struct {
+	packet  *rtp.Packet
+	release chan struct{}
+	once    sync.Once
+}
+
+func (track *packetAfterDeadlineTrack) ReadRTP() (*rtp.Packet, error) {
+	<-track.release
+	return track.packet, nil
+}
+
+func (track *packetAfterDeadlineTrack) SetReadDeadline(time.Time) error {
+	track.once.Do(func() { close(track.release) })
+	return nil
 }
 
 func (track *trackFixture) ReadRTP() (*rtp.Packet, error) {
@@ -29,6 +52,15 @@ func (track *trackFixture) ReadRTP() (*rtp.Packet, error) {
 	}
 	track.mu.Unlock()
 	<-track.release
+	if track.eof != nil {
+		select {
+		case track.eof <- struct{}{}:
+		default:
+		}
+	}
+	if track.readErr != nil {
+		return nil, track.readErr
+	}
 	return nil, io.EOF
 }
 
@@ -62,6 +94,352 @@ func (writer packetCaptureWriter) WriteRTP(packet *rtp.Packet) error {
 }
 
 func (writer packetCaptureWriter) Close() error { return nil }
+
+func TestRTPTrackWriterNormalizesSignalingMIMECodec(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{release: make(chan struct{})}
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: func() int64 { return 0 }, Muxer: copyMuxer{},
+		OperationTimeout: time.Second,
+		OnSegment:        func(context.Context, SegmentDescriptor, string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writer.codec != "vp8" {
+		t.Fatalf("signaling MIME codec was not normalized: %q", writer.codec)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := writer.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRTPTrackWriterTreatsRemoteEOFAsCleanTrackEnd(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{
+		release: make(chan struct{}),
+		eof:     make(chan struct{}, 1),
+		packets: []*rtp.Packet{vp8Packet(1, true)},
+	}
+	var clockCalls int
+	clock := func() int64 {
+		clockCalls++
+		if clockCalls == 1 {
+			return 0
+		}
+		return 500
+	}
+	segmentReady := make(chan SegmentDescriptor, 1)
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: clock, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		OnSegment: func(_ context.Context, descriptor SegmentDescriptor, _ string) error {
+			segmentReady <- descriptor
+			return nil
+		},
+		newPacketWriter: func(_, path string, _ *rtp.Packet) (packetWriter, error) {
+			return packetCaptureWriter{path: path, payloads: &[][]byte{}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(fixture.release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	select {
+	case <-fixture.eof:
+	case <-ctx.Done():
+		t.Fatal("remote track did not reach EOF")
+	}
+	if err := writer.CloseAt(ctx, 750); err != nil {
+		t.Fatalf("remote EOF failed the track writer: %v", err)
+	}
+	select {
+	case segment := <-segmentReady:
+		if segment.StartMS != 0 || segment.EndMS != 750 {
+			t.Fatalf("unexpected EOF segment boundary: %+v", segment)
+		}
+	case <-ctx.Done():
+		t.Fatal("remote EOF did not close the current segment")
+	}
+}
+
+func TestRTPTrackWriterWaitsForAuthoritativeBoundaryAfterRemoteTimeout(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{
+		release: make(chan struct{}),
+		eof:     make(chan struct{}, 1),
+		packets: []*rtp.Packet{vp8Packet(1, true)},
+		readErr: remoteTrackTimeout{},
+	}
+	segmentReady := make(chan SegmentDescriptor, 1)
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: func() int64 { return 500 }, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		OnSegment: func(_ context.Context, descriptor SegmentDescriptor, _ string) error {
+			segmentReady <- descriptor
+			return nil
+		},
+		newPacketWriter: func(_, path string, _ *rtp.Packet) (packetWriter, error) {
+			return packetCaptureWriter{path: path, payloads: &[][]byte{}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(fixture.release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	select {
+	case <-fixture.eof:
+	case <-ctx.Done():
+		t.Fatal("remote track did not reach its timeout")
+	}
+	select {
+	case err := <-writer.Errors():
+		t.Fatalf("remote timeout escaped before the authoritative boundary: %v", err)
+	default:
+	}
+	if err := writer.CloseAt(ctx, 750); err != nil {
+		t.Fatalf("remote timeout failed the track writer: %v", err)
+	}
+	select {
+	case segment := <-segmentReady:
+		if segment.StartMS != 500 || segment.EndMS != 750 {
+			t.Fatalf("unexpected timeout segment boundary: %+v", segment)
+		}
+	case <-ctx.Done():
+		t.Fatal("remote timeout did not close at the authoritative boundary")
+	}
+}
+
+func TestRTPTrackWriterDeclaresGapBeforeFirstCapturablePacket(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{
+		release: make(chan struct{}),
+		eof:     make(chan struct{}, 1),
+		packets: []*rtp.Packet{vp8Packet(1, true)},
+	}
+	type gap struct{ startMS, endMS int64 }
+	gaps := make(chan gap, 1)
+	segmentReady := make(chan SegmentDescriptor, 1)
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: func() int64 { return 250 }, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		CoverageStartMS: 100,
+		OnInitialGap: func(startMS, endMS int64) error {
+			gaps <- gap{startMS: startMS, endMS: endMS}
+			return nil
+		},
+		OnSegment: func(_ context.Context, descriptor SegmentDescriptor, _ string) error {
+			segmentReady <- descriptor
+			return nil
+		},
+		newPacketWriter: func(_, path string, _ *rtp.Packet) (packetWriter, error) {
+			return packetCaptureWriter{path: path, payloads: &[][]byte{}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(fixture.release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	select {
+	case <-fixture.eof:
+	case <-ctx.Done():
+		t.Fatal("remote track did not reach EOF")
+	}
+	if err := writer.CloseAt(ctx, 750); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-gaps:
+		if got.startMS != 100 || got.endMS != 250 {
+			t.Fatalf("unexpected initial source gap: %+v", got)
+		}
+	default:
+		t.Fatal("initial source-unavailable gap was not declared")
+	}
+	select {
+	case segment := <-segmentReady:
+		if segment.StartMS != 250 || segment.EndMS != 750 {
+			t.Fatalf("unexpected segment boundary: %+v", segment)
+		}
+	default:
+		t.Fatal("segment was not delivered")
+	}
+}
+
+func TestRTPTrackWriterDeclaresGapWhenTrackEndsWithoutMedia(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{release: make(chan struct{}), eof: make(chan struct{}, 1)}
+	type gap struct{ startMS, endMS int64 }
+	gaps := make(chan gap, 1)
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: func() int64 { return 500 }, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		CoverageStartMS: 100,
+		OnInitialGap: func(startMS, endMS int64) error {
+			gaps <- gap{startMS: startMS, endMS: endMS}
+			return nil
+		},
+		OnSegment: func(context.Context, SegmentDescriptor, string) error {
+			t.Fatal("empty track produced a segment")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(fixture.release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	select {
+	case <-fixture.eof:
+	case <-ctx.Done():
+		t.Fatal("remote track did not reach EOF")
+	}
+	if err := writer.CloseAt(ctx, 750); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-gaps:
+		if got.startMS != 100 || got.endMS != 750 {
+			t.Fatalf("unexpected empty-track gap: %+v", got)
+		}
+	default:
+		t.Fatal("empty active track gap was not declared")
+	}
+}
+
+func TestRTPTrackWriterResolvesPendingGapWhenPacketArrivesAfterClose(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	track := &packetAfterDeadlineTrack{
+		packet:  vp8Packet(1, false),
+		release: make(chan struct{}),
+	}
+	type gap struct{ startMS, endMS int64 }
+	gaps := make(chan gap, 1)
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: track, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: func() int64 { return 500 }, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		CoverageStartMS: 100,
+		OnInitialGap: func(startMS, endMS int64) error {
+			gaps <- gap{startMS: startMS, endMS: endMS}
+			return nil
+		},
+		OnSegment: func(context.Context, SegmentDescriptor, string) error {
+			t.Fatal("packet returned after close produced a segment")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := writer.CloseAt(ctx, 750); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-gaps:
+		if got.startMS != 100 || got.endMS != 750 {
+			t.Fatalf("unexpected post-close packet gap: %+v", got)
+		}
+	default:
+		t.Fatal("post-close packet left pending coverage unresolved")
+	}
+}
+
+func TestRTPTrackWriterCleansUpWhenInitialGapCallbackFails(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{
+		release: make(chan struct{}),
+		packets: []*rtp.Packet{vp8Packet(1, true)},
+	}
+	root := t.TempDir()
+	injected := errors.New("persist initial gap")
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: root,
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: func() int64 { return 250 }, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		CoverageStartMS: 100,
+		OnInitialGap: func(int64, int64) error {
+			return injected
+		},
+		OnSegment: func(context.Context, SegmentDescriptor, string) error { return nil },
+		newPacketWriter: func(_, path string, _ *rtp.Packet) (packetWriter, error) {
+			if err := os.WriteFile(path, []byte{1}, 0o600); err != nil {
+				return nil, err
+			}
+			return packetCaptureWriter{path: path, payloads: &[][]byte{}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-writer.Errors():
+		if !errors.Is(got, injected) {
+			t.Fatalf("initial gap error was not preserved: %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial gap failure was not reported")
+	}
+	matches, err := filepath.Glob(filepath.Join(root, "*.part"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("initial gap failure leaked staging files: %v", matches)
+	}
+}
 
 func TestRTPTrackWriterCreatesIndependentClosedVP8Segments(t *testing.T) {
 	participantID := ParticipantInstanceID("rec-1", "participant-1")

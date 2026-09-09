@@ -137,6 +137,97 @@ func TestCheckpointBoundaryDefersOpenIntervalAtTimeZero(t *testing.T) {
 	}
 }
 
+func TestCheckpointBoundaryDefersFiniteGapPastRequestedTime(t *testing.T) {
+	timeline, _ := NewTimelineState("rec-1")
+	trackID, err := TrackID("rec-1", ParticipantInstanceID("rec-1", "raw-p1"), SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.ApplySnapshot(Snapshot{
+		ProtocolVersion: ProtocolVersion, RecordingID: "rec-1", Revision: 1,
+		Participants: []Participant{{ParticipantID: "raw-p1", DisplayName: "Alex"}},
+		Producers: []Producer{{
+			ProducerID: "producer-1", ParticipantID: "raw-p1", DisplayName: "Alex",
+			Kind: KindVideo, Source: SourceCamera,
+		}},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.DeclareGap(trackID, 500, 600, "source_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	boundary, err := timeline.CheckpointBoundary(550, false)
+	if !errors.Is(err, ErrCheckpointBoundaryUnavailable) || boundary != 0 {
+		t.Fatalf("checkpoint exposed a future gap: %d %v", boundary, err)
+	}
+	boundary, err = timeline.CheckpointBoundary(600, false)
+	if err != nil || boundary != 600 {
+		t.Fatalf("checkpoint did not include a completed gap: %d %v", boundary, err)
+	}
+	records, err := timeline.RecordsThrough(boundary, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundGap := false
+	for _, record := range records {
+		if record.Category == "gaps" && record.EndMS != nil && *record.EndMS == 600 {
+			foundGap = true
+		}
+	}
+	if !foundGap {
+		t.Fatalf("completed gap was not preserved: %+v", records)
+	}
+}
+
+func TestCheckpointBoundaryDefersBeforePendingCoverageBecomesGap(t *testing.T) {
+	timeline, _ := NewTimelineState("rec-1")
+	trackID, err := TrackID("rec-1", ParticipantInstanceID("rec-1", "raw-p1"), SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.ApplySnapshot(Snapshot{
+		ProtocolVersion: ProtocolVersion, RecordingID: "rec-1", Revision: 1,
+		Participants: []Participant{{ParticipantID: "raw-p1", DisplayName: "Alex"}},
+		Producers: []Producer{{
+			ProducerID: "producer-1", ParticipantID: "raw-p1", DisplayName: "Alex",
+			Kind: KindVideo, Source: SourceCamera,
+		}},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := timeline.BeginTrackCoverage(trackID, 0); err != nil {
+		t.Fatal(err)
+	}
+	boundary, err := timeline.CheckpointBoundary(500, false)
+	if !errors.Is(err, ErrCheckpointBoundaryUnavailable) || boundary != 0 {
+		t.Fatalf("checkpoint crossed unresolved track coverage: %d %v", boundary, err)
+	}
+	if err := timeline.ResolveTrackCoverage(trackID, 0, 600); err != nil {
+		t.Fatal(err)
+	}
+	boundary, err = timeline.CheckpointBoundary(600, false)
+	if err != nil || boundary != 600 {
+		t.Fatalf("resolved coverage did not unblock checkpoint: %d %v", boundary, err)
+	}
+	records, err := timeline.RecordsThrough(boundary, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gapCount := 0
+	for _, record := range records {
+		if record.Category != "gaps" {
+			continue
+		}
+		gapCount++
+		if record.StartMS == nil || record.EndMS == nil || *record.StartMS != 0 || *record.EndMS != 600 {
+			t.Fatalf("unexpected resolved coverage gap: %+v", record)
+		}
+	}
+	if gapCount != 1 {
+		t.Fatalf("resolved coverage produced %d gaps: %+v", gapCount, records)
+	}
+}
+
 func TestAuthoritativeReconnectSnapshotClosesAbsentAndAppliesPausedState(t *testing.T) {
 	timeline, _ := NewTimelineState("rec-1")
 	first := Snapshot{

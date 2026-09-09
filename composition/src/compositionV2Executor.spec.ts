@@ -4,7 +4,13 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { verifyStagedSliceProbe, type CaptureV2Manifest, type ManifestSegment, type Source } from "./compositionV2.js";
+import {
+  compileV2StagingPlan,
+  verifyStagedSliceProbe,
+  type CaptureV2Manifest,
+  type ManifestSegment,
+  type Source,
+} from "./compositionV2.js";
 import { executeV2Composition } from "./compositionV2Executor.js";
 import { ChildProcessRunner, type ProcessRunner } from "./processRunner.js";
 
@@ -126,6 +132,95 @@ describe("capture-v2 staged executor", () => {
     const remaining = await readdir(directory);
     expect(remaining).toEqual(["output.mp4"]);
   });
+
+  it("seeks near a late scene before FFmpeg framesync scans the source", async () => {
+    const directory = await temporaryDirectory();
+    const camera = track("camera", "pi-a", "camera");
+    const cameraSegment = {
+      ...segment("upload-camera", camera.trackId, "pi-a", "camera"),
+      endMs: 9_833,
+    };
+    const value = manifest({
+      timelineEndMs: 9_833,
+      participantInstances: [participant("pi-a")],
+      participantIntervals: [
+        { participantInstanceId: "pi-a", startMs: 0, endMs: 9_359 },
+        { participantInstanceId: "pi-a", startMs: 9_359, endMs: 9_833 },
+      ],
+      tracks: [camera],
+      trackIntervals: [{ trackId: camera.trackId, startMs: 0, endMs: 9_833, state: "active" }],
+      segments: [cameraSegment],
+    });
+    const plan = compileV2StagingPlan(value);
+    expect(plan.scenes.at(-1)!.videoPasses[0]!.filtergraph)
+      .toContain("tpad=stop_mode=clone:stop_duration=1.474,trim=start=1:duration=0.474");
+    const runner = new FileCreatingRunner();
+    await executeV2Composition({
+      manifest: value,
+      sourcePaths: new Map([[cameraSegment.uploadId, join(directory, "camera.webm")]]),
+      directory,
+      ffmpegPath: "ffmpeg",
+      runner,
+      timeoutMs: 1_000,
+      maximumIntermediateBytes: 10_000,
+      maximumOutputBytes: 10_000,
+      maximumWorkspaceBytes: 100_000,
+      leaseHealthy: () => true,
+      verifySlice: async () => undefined,
+    });
+    expect(runner.calls.some((args) => {
+      const source = args.indexOf(join(directory, "camera.webm"));
+      return source >= 3
+        && args[source - 3] === "-ss"
+        && args[source - 2] === "8.359"
+        && args[source - 1] === "-i";
+    })).toBe(true);
+  });
+
+  it("renders a late sparse video scene with pinned FFmpeg instead of a header-only stage", async () => {
+    const directory = await temporaryDirectory();
+    const runner = new ChildProcessRunner();
+    const video = join(directory, "late-screen.webm");
+    await runner.run(ffmpeg.path, [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "testsrc=size=160x90:rate=3:duration=10.7",
+      "-an", "-c:v", "libvpx", "-g", "30", "-pix_fmt", "yuv420p", video,
+    ], 20_000);
+    const screen = track("screen", "pi-a", "screen");
+    const screenSegment = {
+      ...segment("upload-screen", screen.trackId, "pi-a", "screen"),
+      endMs: 9_833,
+    };
+    const value = manifest({
+      timelineEndMs: 9_833,
+      participantInstances: [participant("pi-a")],
+      participantIntervals: [{ participantInstanceId: "pi-a", startMs: 9_359, endMs: 9_833 }],
+      tracks: [screen],
+      trackIntervals: [{ trackId: screen.trackId, startMs: 0, endMs: 9_833, state: "active" }],
+      segments: [screenSegment],
+    });
+    const output = await executeV2Composition({
+      manifest: value,
+      sourcePaths: new Map([[screenSegment.uploadId, video]]),
+      directory,
+      ffmpegPath: ffmpeg.path,
+      runner,
+      timeoutMs: 20_000,
+      maximumIntermediateBytes: 100_000_000,
+      maximumOutputBytes: 100_000_000,
+      maximumWorkspaceBytes: 400_000_000,
+      leaseHealthy: () => true,
+      verifySlice: pinnedSliceVerifier(runner),
+    });
+    const probe = await runner.run(ffprobe.path, [
+      "-v", "error", "-show_streams", "-show_format", "-of", "json", output,
+    ], 10_000);
+    const parsed = JSON.parse(probe.stdout) as { streams: Array<{ codec_type: string }> };
+    expect(parsed.streams).toEqual(expect.arrayContaining([
+      expect.objectContaining({ codec_type: "video" }),
+      expect.objectContaining({ codec_type: "audio" }),
+    ]));
+  }, 60_000);
 
   it("fails closed when the lease is lost between stages", async () => {
     const directory = await temporaryDirectory();
@@ -297,6 +392,108 @@ describe("capture-v2 staged executor", () => {
       expect.objectContaining({ codec_type: "audio", codec_name: "aac" }),
     ]));
     expect(Math.abs(Number(parsed.format.duration) - 0.1)).toBeLessThanOrEqual(0.25);
+  }, 30_000);
+
+  it("uses avatar fallback for a sub-frame declared video tail", async () => {
+    const directory = await temporaryDirectory();
+    const runner = new ChildProcessRunner();
+    const video = join(directory, "short-video.webm");
+    await runner.run(ffmpeg.path, [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=0.1",
+      "-an", "-c:v", "libvpx", "-pix_fmt", "yuv420p", video,
+    ], 10_000);
+    const camera = track("camera", "pi-a", "camera");
+    const cameraSegment = { ...segment("upload-camera", camera.trackId, "pi-a", "camera"), endMs: 124 };
+    const value = manifest({
+      timelineEndMs: 124,
+      participantInstances: [participant("pi-a")],
+      participantIntervals: [
+        { participantInstanceId: "pi-a", startMs: 0, endMs: 100 },
+        { participantInstanceId: "pi-a", startMs: 100, endMs: 124 },
+      ],
+      tracks: [camera],
+      trackIntervals: [{ trackId: camera.trackId, startMs: 0, endMs: 124, state: "active" }],
+      segments: [cameraSegment],
+    });
+    const plan = compileV2StagingPlan(value);
+    expect(plan.scenes.at(-1)!.videoPasses).toHaveLength(0);
+    const screen = track("screen", "pi-a", "screen");
+    const screenSegment = { ...cameraSegment, uploadId: "upload-screen", trackId: screen.trackId, source: "screen" as const };
+    const screenPlan = compileV2StagingPlan({
+      ...value,
+      tracks: [screen],
+      trackIntervals: [{ trackId: screen.trackId, startMs: 0, endMs: 124, state: "active" }],
+      segments: [screenSegment],
+    });
+    expect(screenPlan.scenes.at(-1)!.videoPasses).toHaveLength(0);
+    const output = await executeV2Composition({
+      manifest: value,
+      sourcePaths: new Map([[cameraSegment.uploadId, video]]),
+      directory,
+      ffmpegPath: ffmpeg.path,
+      runner,
+      timeoutMs: 10_000,
+      maximumIntermediateBytes: 10_000_000,
+      maximumOutputBytes: 10_000_000,
+      maximumWorkspaceBytes: 100_000_000,
+      leaseHealthy: () => true,
+      verifySlice: pinnedSliceVerifier(runner),
+    });
+    const probe = await runner.run(ffprobe.path, [
+      "-v", "error", "-show_streams", "-show_format", "-of", "json", output,
+    ], 10_000);
+    const parsed = JSON.parse(probe.stdout) as { streams: Array<{ codec_type: string }> };
+    expect(parsed.streams).toEqual(expect.arrayContaining([
+      expect.objectContaining({ codec_type: "video" }),
+      expect.objectContaining({ codec_type: "audio" }),
+    ]));
+  }, 30_000);
+
+  it("clones the last decoded frame across a declared video tail", async () => {
+    const directory = await temporaryDirectory();
+    const runner = new ChildProcessRunner();
+    const video = join(directory, "short-video.webm");
+    await runner.run(ffmpeg.path, [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "testsrc=size=160x90:rate=24:duration=0.1",
+      "-an", "-c:v", "libvpx", "-pix_fmt", "yuv420p", video,
+    ], 10_000);
+    const camera = track("camera", "pi-a", "camera");
+    const cameraSegment = { ...segment("upload-camera", camera.trackId, "pi-a", "camera"), endMs: 160 };
+    const value = manifest({
+      timelineEndMs: 160,
+      participantInstances: [participant("pi-a")],
+      participantIntervals: [
+        { participantInstanceId: "pi-a", startMs: 0, endMs: 100 },
+        { participantInstanceId: "pi-a", startMs: 100, endMs: 160 },
+      ],
+      tracks: [camera],
+      trackIntervals: [{ trackId: camera.trackId, startMs: 0, endMs: 160, state: "active" }],
+      segments: [cameraSegment],
+    });
+    expect(compileV2StagingPlan(value).scenes.at(-1)!.videoPasses[0]!.sourceSegments).toHaveLength(1);
+    const output = await executeV2Composition({
+      manifest: value,
+      sourcePaths: new Map([[cameraSegment.uploadId, video]]),
+      directory,
+      ffmpegPath: ffmpeg.path,
+      runner,
+      timeoutMs: 10_000,
+      maximumIntermediateBytes: 10_000_000,
+      maximumOutputBytes: 10_000_000,
+      maximumWorkspaceBytes: 100_000_000,
+      leaseHealthy: () => true,
+      verifySlice: pinnedSliceVerifier(runner),
+    });
+    const probe = await runner.run(ffprobe.path, [
+      "-v", "error", "-show_streams", "-show_format", "-of", "json", output,
+    ], 10_000);
+    const parsed = JSON.parse(probe.stdout) as { streams: Array<{ codec_type: string }> };
+    expect(parsed.streams).toEqual(expect.arrayContaining([
+      expect.objectContaining({ codec_type: "video" }),
+      expect.objectContaining({ codec_type: "audio" }),
+    ]));
   }, 30_000);
 
   it("collapses ten one-millisecond scenes onto the authoritative global frame clock", async () => {

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 
 const maximumStdoutBytes = 4 * 1024 * 1024;
-const maximumStderrBytes = 16 * 1024;
+const maximumStderrBytes = 1024 * 1024;
 
 export interface ProcessRunner {
   run(command: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<{ stdout: string; stderr?: string }>;
@@ -46,10 +46,14 @@ export class ChildProcessRunner implements ProcessRunner {
       const timer = setTimeout(() => terminate("timeout"), timeoutMs);
       child.once("error", (error) => finish(() => reject(error)));
       child.once("exit", (code, exitSignal) => finish(() => {
+        const stderrText = Buffer.concat(stderr).toString("utf8");
         if (terminationReason === "timeout") return reject(new Error(`${command} timed out`));
         if (terminationReason === "aborted") return reject(new Error(`${command} aborted after lease loss`));
-        if (terminationReason === "output") return reject(new Error(`${command} output exceeded its bound`));
-        const stderrText = Buffer.concat(stderr).toString("utf8");
+        if (terminationReason === "output") {
+          return reject(new Error(
+            `${command} output exceeded its bound: ${stderrText.slice(0, 2048)}`,
+          ));
+        }
         if (code !== 0) return reject(new Error(`${command} exited with ${String(code ?? exitSignal)}: ${stderrText.slice(0, 2048)}`));
         resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: stderrText });
       }));

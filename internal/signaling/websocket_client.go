@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"sync"
@@ -48,8 +49,9 @@ type SessionIdentity struct {
 // WebSocketSignalingClient is an asynchronous recording-bot.v1 client. The
 // admission is accepted separately and is never retained in an error or log.
 type WebSocketSignalingClient struct {
-	connection *websocket.Conn
-	cancel     context.CancelFunc
+	connection    *websocket.Conn
+	cancel        context.CancelFunc
+	signalingHost string
 
 	mu       sync.Mutex
 	sequence uint64
@@ -101,7 +103,7 @@ func dialWebSocketSignaling(
 	if admission == "" {
 		return nil, ErrAdmissionRejected
 	}
-	endpoint, err := privateSignalingURL(signalingURL, admission)
+	endpoint, signalingHost, err := privateSignalingURL(signalingURL, admission)
 	if err != nil {
 		return nil, err
 	}
@@ -123,14 +125,15 @@ func dialWebSocketSignaling(
 
 	readContext, cancel := context.WithCancel(context.Background())
 	client := &WebSocketSignalingClient{
-		connection: connection,
-		cancel:     cancel,
-		pending:    map[string]chan responseResult{},
-		snapshots:  make(chan Snapshot, 1),
-		lifecycle:  make(chan Event, 256),
-		admitted:   make(chan error, 1),
-		done:       make(chan struct{}),
-		identity:   expected,
+		connection:    connection,
+		cancel:        cancel,
+		signalingHost: signalingHost,
+		pending:       map[string]chan responseResult{},
+		snapshots:     make(chan Snapshot, 1),
+		lifecycle:     make(chan Event, 256),
+		admitted:      make(chan error, 1),
+		done:          make(chan struct{}),
+		identity:      expected,
 	}
 	go client.readLoop(readContext)
 
@@ -149,20 +152,21 @@ func dialWebSocketSignaling(
 	}
 }
 
-func privateSignalingURL(rawURL, admission string) (string, error) {
+func privateSignalingURL(rawURL, admission string) (string, string, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", errors.New("invalid private signaling URL")
+		return "", "", errors.New("invalid private signaling URL")
 	}
 	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
-		return "", errors.New("private signaling URL must use ws or wss")
+		return "", "", errors.New("private signaling URL must use ws or wss")
 	}
+	hostname := parsed.Hostname()
 	parsed.Path = "/internal/recording-bot/v1"
 	parsed.RawQuery = ""
 	query := parsed.Query()
 	query.Set("admission", admission)
 	parsed.RawQuery = query.Encode()
-	return parsed.String(), nil
+	return parsed.String(), hostname, nil
 }
 
 func (client *WebSocketSignalingClient) RouterRTPCapabilities(
@@ -175,8 +179,61 @@ func (client *WebSocketSignalingClient) CreateRecvTransport(
 	ctx context.Context,
 ) (TransportOptions, error) {
 	var transport TransportOptions
-	err := client.requestInto(ctx, "bot:createRecvTransport", map[string]any{}, &transport)
-	return transport, err
+	if err := client.requestInto(ctx, "bot:createRecvTransport", map[string]any{}, &transport); err != nil {
+		return TransportOptions{}, err
+	}
+	candidates, err := rewriteLocalICECandidates(ctx, transport.ICECandidates, client.signalingHost)
+	if err != nil {
+		return TransportOptions{}, err
+	}
+	transport.ICECandidates = candidates
+	return transport, nil
+}
+
+func rewriteLocalICECandidates(
+	ctx context.Context,
+	candidates []ICECandidate,
+	signalingHost string,
+) ([]ICECandidate, error) {
+	requiresRewrite := false
+	for _, candidate := range candidates {
+		address := net.ParseIP(candidate.IP)
+		if address != nil && (address.IsLoopback() || address.IsUnspecified()) {
+			requiresRewrite = true
+			break
+		}
+	}
+	if !requiresRewrite {
+		return candidates, nil
+	}
+
+	addresses, err := net.DefaultResolver.LookupIP(ctx, "ip", signalingHost)
+	if err != nil {
+		return nil, fmt.Errorf("resolve signaling host for local ICE candidate: %w", err)
+	}
+	rewritten := append([]ICECandidate{}, candidates...)
+	for index, candidate := range rewritten {
+		current := net.ParseIP(candidate.IP)
+		if current == nil || (!current.IsLoopback() && !current.IsUnspecified()) {
+			continue
+		}
+		replacement := matchingIPFamily(addresses, current)
+		if replacement == nil {
+			return nil, errors.New("signaling host has no address matching the local ICE candidate")
+		}
+		rewritten[index].IP = replacement.String()
+	}
+	return rewritten, nil
+}
+
+func matchingIPFamily(addresses []net.IP, expected net.IP) net.IP {
+	wantsIPv4 := expected.To4() != nil
+	for _, address := range addresses {
+		if (address.To4() != nil) == wantsIPv4 {
+			return address
+		}
+	}
+	return nil
 }
 
 func (client *WebSocketSignalingClient) SyncSnapshot(ctx context.Context) (Snapshot, error) {

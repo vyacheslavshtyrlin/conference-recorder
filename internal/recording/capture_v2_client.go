@@ -35,11 +35,20 @@ type UploadTarget struct {
 }
 
 type CaptureAPIError struct {
-	Status int
-	Code   string
+	Status  int
+	Code    string
+	Message string
 }
 
 func (failure *CaptureAPIError) Error() string {
+	if failure.Message != "" {
+		return fmt.Sprintf(
+			"capture API failed with status %d code %s: %s",
+			failure.Status,
+			failure.Code,
+			failure.Message,
+		)
+	}
 	return fmt.Sprintf("capture API failed with status %d code %s", failure.Status, failure.Code)
 }
 
@@ -319,7 +328,44 @@ func (client *PrivateUploadClient) Seal(ctx context.Context, fence CaptureFence,
 	return response, nil
 }
 
+func (client *PrivateUploadClient) Fail(
+	ctx context.Context,
+	fence CaptureFence,
+	code string,
+	message string,
+) error {
+	if err := validateCaptureFence(fence); err != nil || code == "" || message == "" {
+		return errors.New("invalid capture failure")
+	}
+	var response struct {
+		Failed bool `json:"failed"`
+	}
+	if err := client.recordingJSON(ctx, http.MethodPost, fence, "capture-v2/fail", map[string]any{
+		"protocolVersion":   CaptureProtocolVersion,
+		"captureGeneration": fence.CaptureGeneration,
+		"code":              code,
+		"message":           message,
+	}, &response); err != nil {
+		return err
+	}
+	if !response.Failed {
+		return errors.New("capture API returned an invalid failure response")
+	}
+	return nil
+}
+
 func (client *PrivateUploadClient) captureJSON(
+	ctx context.Context,
+	method string,
+	fence CaptureFence,
+	path string,
+	body any,
+	destination any,
+) error {
+	return client.recordingJSON(ctx, method, fence, "capture-v2/"+path, body, destination)
+}
+
+func (client *PrivateUploadClient) recordingJSON(
 	ctx context.Context,
 	method string,
 	fence CaptureFence,
@@ -329,7 +375,7 @@ func (client *PrivateUploadClient) captureJSON(
 ) error {
 	for attempt := 0; attempt < 4; attempt++ {
 		operationContext, cancel := context.WithTimeout(ctx, client.apiTimeout)
-		err := client.captureJSONOnce(operationContext, method, fence, path, body, destination)
+		err := client.recordingJSONOnce(operationContext, method, fence, path, body, destination)
 		cancel()
 		if err == nil || !retryableCaptureError(err) {
 			return err
@@ -344,7 +390,7 @@ func (client *PrivateUploadClient) captureJSON(
 	return errors.New("capture API retries exhausted")
 }
 
-func (client *PrivateUploadClient) captureJSONOnce(
+func (client *PrivateUploadClient) recordingJSONOnce(
 	ctx context.Context,
 	method string,
 	fence CaptureFence,
@@ -352,7 +398,7 @@ func (client *PrivateUploadClient) captureJSONOnce(
 	body any,
 	destination any,
 ) error {
-	allowRecoveryDiscovery := path == "recovery" || strings.HasPrefix(path, "recovery?")
+	allowRecoveryDiscovery := path == "capture-v2/recovery" || strings.HasPrefix(path, "capture-v2/recovery?")
 	discoveryFence := allowRecoveryDiscovery && fence.CaptureGeneration == 0 &&
 		fence.RecordingID != "" && fence.WorkerID != "" && fence.WorkerGenerationID != ""
 	if err := validateCaptureFence(fence); err != nil && !discoveryFence {
@@ -369,7 +415,7 @@ func (client *PrivateUploadClient) captureJSONOnce(
 	target := cloneURL(client.baseURL)
 	requestPath, rawQuery, _ := strings.Cut(path, "?")
 	target.Path = strings.TrimSuffix(target.Path, "/") + "/internal/v1/recordings/" +
-		url.PathEscape(fence.RecordingID) + "/capture-v2/" + requestPath
+		url.PathEscape(fence.RecordingID) + "/" + requestPath
 	target.RawQuery = rawQuery
 	var requestBody io.Reader
 	if body != nil {
@@ -397,8 +443,9 @@ func (client *PrivateUploadClient) captureJSONOnce(
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var failure struct {
-			Error string `json:"error"`
-			Code  string `json:"code"`
+			Error   string `json:"error"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
 		}
 		_ = json.Unmarshal(responseBytes, &failure)
 		code := failure.Code
@@ -408,7 +455,14 @@ func (client *PrivateUploadClient) captureJSONOnce(
 		if code == "" {
 			code = "CAPTURE_API_ERROR"
 		}
-		return &CaptureAPIError{Status: response.StatusCode, Code: code}
+		return &CaptureAPIError{
+			Status: response.StatusCode,
+			Code:   code,
+			Message: strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(
+				failure.Message,
+				"\r", " ",
+			), "\n", " "), "\t", " "),
+		}
 	}
 	if destination == nil {
 		return nil

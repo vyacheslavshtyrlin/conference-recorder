@@ -133,6 +133,50 @@ func TestProductionControlReadinessFailsClosedAndAdvertisesOnlyWhenReady(t *test
 	}
 }
 
+func TestProductionControlReadinessDoesNotReportActiveCaptureForRecovery(t *testing.T) {
+	runner := &recoveryHealthBlockingRunner{
+		blockingProbeRunner: &blockingProbeRunner{started: make(chan struct{}, 1)},
+		recoverable:         []string{"rec-active", "rec-stale"},
+		finalizations:       []string{"rec-active", "rec-finalization"},
+	}
+	shim, err := NewProductionControlHandler(ControlShimConfig{
+		WorkerID: "worker-a", GenerationID: "generation-a", JWTSecret: testControlSecret,
+		StartTimeout: time.Second, StopTimeout: time.Second,
+	}, runner, func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shim.Close()
+	server := httptest.NewServer(shim)
+	defer server.Close()
+
+	token := testControlToken(time.Now())
+	body := testAttemptBody("rec-active", "attempt-active", "one-use-admission-secret")
+	if status := putAttempt(t, server.URL, body, token, "worker-a", "generation-a"); status != http.StatusAccepted {
+		t.Fatalf("create status=%d", status)
+	}
+	waitFor(t, runner.started)
+
+	response, err := getReady(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var ready struct {
+		RecoverableRecordingIDs         []string `json:"recoverableRecordingIds"`
+		PendingFinalizationRecordingIDs []string `json:"pendingFinalizationRecordingIds"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(ready.RecoverableRecordingIDs, ",") != "rec-stale" {
+		t.Fatalf("active capture leaked into recovery report: %v", ready.RecoverableRecordingIDs)
+	}
+	if strings.Join(ready.PendingFinalizationRecordingIDs, ",") != "rec-finalization" {
+		t.Fatalf("active capture leaked into finalization report: %v", ready.PendingFinalizationRecordingIDs)
+	}
+}
+
 func TestControlShimAuthFenceIdempotencyCapacityAndStop(t *testing.T) {
 	server, runner := newControlTestServer(t)
 	body := testAttemptBody("rec-1", "attempt-1", "one-use-admission-secret")
@@ -277,6 +321,33 @@ func TestControlShimStopIsBounded(t *testing.T) {
 	waitForEmptyReadiness(t, server.URL)
 }
 
+func TestControlShimStopReportsRunnerFinalizationFailure(t *testing.T) {
+	runner := &failedStopRunner{started: make(chan struct{})}
+	server, _ := newCustomControlTestServer(t, runner, time.Second, time.Second)
+	token := testControlToken(time.Now())
+	if status := putAttempt(
+		t,
+		server.URL,
+		testAttemptBody("rec-failed-stop", "attempt-failed-stop", "admission"),
+		token,
+		"worker-a",
+		"generation-a",
+	); status != http.StatusAccepted {
+		t.Fatalf("create status=%d", status)
+	}
+	waitFor(t, runner.started)
+
+	responseBody, status := doDeleteAttempt(t, server.URL, "rec-failed-stop", token)
+	if status != http.StatusServiceUnavailable ||
+		!strings.Contains(responseBody, `"error":"BOT_FINALIZATION_FAILED"`) {
+		t.Fatalf("failed stop status=%d body=%s", status, responseBody)
+	}
+	ready := waitForFailedReadiness(t, server.URL)
+	if len(ready.Attempts) != 1 || ready.Attempts[0].FailureCode != "BOT_FINALIZATION_FAILED" {
+		t.Fatalf("failed stop readiness=%+v", ready)
+	}
+}
+
 func TestControlShimRejectsExpiredJWTAndInvalidPayload(t *testing.T) {
 	server, _ := newControlTestServer(t)
 	body := testAttemptBody("rec-1", "attempt-1", "admission")
@@ -395,6 +466,58 @@ func TestControlShimStartupFailureAndTimeoutFreeSlot(t *testing.T) {
 			deleteAttempt(t, server.URL, "rec-after-failure", testControlToken(time.Now()))
 		})
 	}
+}
+
+func TestControlShimRetainsFailedV2StartupForExactRetryAndHigherGeneration(t *testing.T) {
+	runner := &retryProbeRunner{firstFailure: true}
+	server, _ := newCustomControlTestServer(t, runner, time.Second, time.Second)
+	token := testControlToken(time.Now())
+	failed := testAttemptBody("rec-v2-startup", "attempt-v2-1", "one-use-admission")
+	failed["protocolVersion"] = CaptureProtocolVersion
+	failed["captureGeneration"] = 1
+	failed["captureStartedAt"] = "2026-08-25T10:00:00.000Z"
+
+	firstBody, firstStatus := doPutAttempt(
+		t, server.URL, failed, token, "worker-a", "generation-a",
+	)
+	if firstStatus != 503 || !strings.Contains(firstBody, `"error":"BOT_START_FAILED"`) {
+		t.Fatalf("initial startup failure status=%d body=%s", firstStatus, firstBody)
+	}
+	retryBody, retryStatus := doPutAttempt(
+		t, server.URL, failed, token, "worker-a", "generation-a",
+	)
+	if retryStatus != firstStatus || retryBody != firstBody {
+		t.Fatalf("exact retry changed failure: first=%d %s retry=%d %s", firstStatus, firstBody, retryStatus, retryBody)
+	}
+	runner.mu.Lock()
+	callsAfterRetry := runner.calls
+	runner.mu.Unlock()
+	if callsAfterRetry != 1 {
+		t.Fatalf("exact retry reran one-use admission: calls=%d", callsAfterRetry)
+	}
+
+	conflicting := testAttemptBody("rec-v2-startup", "attempt-v2-2", "replacement-admission")
+	conflicting["protocolVersion"] = CaptureProtocolVersion
+	conflicting["captureGeneration"] = 2
+	conflicting["captureStartedAt"] = failed["captureStartedAt"]
+	conflicting["integrationId"] = "integration-other"
+	conflictBody, conflictStatus := doPutAttempt(
+		t, server.URL, conflicting, token, "worker-a", "generation-a",
+	)
+	if conflictStatus != 409 || !strings.Contains(conflictBody, `"error":"ATTEMPT_CONFLICT"`) {
+		t.Fatalf("changed assignment identity status=%d body=%s", conflictStatus, conflictBody)
+	}
+
+	replacement := testAttemptBody("rec-v2-startup", "attempt-v2-2", "replacement-admission")
+	replacement["protocolVersion"] = CaptureProtocolVersion
+	replacement["captureGeneration"] = 2
+	replacement["captureStartedAt"] = failed["captureStartedAt"]
+	if status := putAttempt(
+		t, server.URL, replacement, token, "worker-a", "generation-a",
+	); status != 202 {
+		t.Fatalf("higher generation replacement status=%d", status)
+	}
+	deleteAttempt(t, server.URL, "rec-v2-startup", token)
 }
 
 func TestControlShimFullRequestIdempotency(t *testing.T) {
@@ -680,14 +803,15 @@ func TestControlShimFailsClosedWhenReadyRunnerExits(t *testing.T) {
 		time.Second,
 	)
 	token := testControlToken(time.Now())
-	if status := putAttempt(
+	status := putAttempt(
 		t,
 		server.URL,
 		testAttemptBody("rec-exit", "attempt-exit", "admission"),
 		token,
 		"worker-a",
 		"generation-a",
-	); status != 202 {
+	)
+	if status != http.StatusAccepted && status != http.StatusServiceUnavailable {
 		t.Fatalf("initially ready status=%d", status)
 	}
 	ready := waitForFailedReadiness(t, server.URL)
@@ -698,7 +822,7 @@ func TestControlShimFailsClosedWhenReadyRunnerExits(t *testing.T) {
 		ready.Attempts[0].FailureCode != "BOT_RUNTIME_EXITED" {
 		t.Fatalf("runner exit did not fail closed: %+v", ready.Attempts[0])
 	}
-	if status := deleteAttempt(t, server.URL, "rec-exit", token); status != 200 {
+	if status := deleteAttempt(t, server.URL, "rec-exit", token); status != http.StatusOK {
 		t.Fatalf("failed attempt cleanup status=%d", status)
 	}
 	waitForEmptyReadiness(t, server.URL)
@@ -746,9 +870,23 @@ type blockingProbeRunner struct {
 	secret  string
 }
 
+type recoveryHealthBlockingRunner struct {
+	*blockingProbeRunner
+	recoverable   []string
+	finalizations []string
+}
+
+func (runner *recoveryHealthBlockingRunner) RecoveryHealth() ([]string, []string, error) {
+	return append([]string{}, runner.recoverable...), append([]string{}, runner.finalizations...), nil
+}
+
 type delayedStopRunner struct {
 	started chan struct{}
 	release chan struct{}
+}
+
+type failedStopRunner struct {
+	started chan struct{}
 }
 
 type startupProbeRunner struct {
@@ -857,6 +995,18 @@ func (runner *delayedStopRunner) Run(
 	close(runner.started)
 	<-runner.release
 	return nil
+}
+
+func (runner *failedStopRunner) Run(
+	ctx context.Context,
+	_ AttemptRequest,
+	ready func(),
+	_ func(ProbeEvidence),
+) error {
+	ready()
+	close(runner.started)
+	<-ctx.Done()
+	return ErrFinalizationFailed
 }
 
 func (runner *blockingProbeRunner) Run(

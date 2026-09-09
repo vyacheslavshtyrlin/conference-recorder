@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ type controlAttempt struct {
 	identity               attemptIdentity
 	fingerprint            [sha256.Size]byte
 	baseFingerprint        [sha256.Size]byte
+	replacementFingerprint [sha256.Size]byte
 	captureProtocolVersion string
 	captureGeneration      int32
 	captureStartedAt       string
@@ -45,6 +47,7 @@ type controlAttempt struct {
 	startupResolved        bool
 	startupErr             error
 	stopRequested          bool
+	stopFailed             bool
 }
 
 type finalizationOperation struct {
@@ -52,6 +55,14 @@ type finalizationOperation struct {
 	done        chan struct{}
 	cancel      context.CancelFunc
 	err         error
+}
+
+type failedAttemptError struct {
+	code string
+}
+
+func (failure *failedAttemptError) Error() string {
+	return "recording attempt failed: " + failure.code
 }
 
 // AttemptSnapshot matches worker discovery fields and adds bounded probe evidence.
@@ -74,6 +85,13 @@ type controlAttemptManager struct {
 	attempts             map[string]*controlAttempt
 	pendingFinalizations map[string]*finalizationOperation
 	closing              bool
+}
+
+type controlHealthSnapshot struct {
+	attempts             []AttemptSnapshot
+	activeRecordingIDs   map[string]struct{}
+	pendingFinalizations []string
+	occupiedSlots        int
 }
 
 func newControlAttemptManager(
@@ -101,6 +119,10 @@ func (manager *controlAttemptManager) create(request recording.AttemptRequest) (
 	if err != nil {
 		return "", err
 	}
+	replacementFingerprint, err := fingerprintReplacementIdentity(request)
+	if err != nil {
+		return "", err
+	}
 	manager.mu.Lock()
 	if manager.closing {
 		manager.mu.Unlock()
@@ -111,7 +133,14 @@ func (manager *controlAttemptManager) create(request recording.AttemptRequest) (
 		return "", errAttemptConflict
 	}
 	if existing := manager.attempts[request.RecordingID]; existing != nil {
-		if existing.fingerprint != fingerprint {
+		if existing.state == "failed" &&
+			canReplaceFailedAttempt(existing, request, replacementFingerprint) {
+			delete(manager.attempts, request.RecordingID)
+		} else {
+			if existing.fingerprint == fingerprint {
+				manager.mu.Unlock()
+				return manager.awaitStartup(existing)
+			}
 			fenceMismatch := existing.identity.attemptID == request.AttemptID &&
 				existing.baseFingerprint == baseFingerprint &&
 				v2AttemptFenceChanged(existing, request)
@@ -121,8 +150,6 @@ func (manager *controlAttemptManager) create(request recording.AttemptRequest) (
 			}
 			return "", errAttemptConflict
 		}
-		manager.mu.Unlock()
-		return manager.awaitStartup(existing)
 	}
 	if manager.occupiedSlotsLocked() >= manager.maxSlots {
 		manager.mu.Unlock()
@@ -138,6 +165,7 @@ func (manager *controlAttemptManager) create(request recording.AttemptRequest) (
 		},
 		fingerprint:            fingerprint,
 		baseFingerprint:        baseFingerprint,
+		replacementFingerprint: replacementFingerprint,
 		captureProtocolVersion: request.ProtocolVersion,
 		captureGeneration:      request.CaptureGeneration,
 		captureStartedAt:       request.CaptureStartedAt,
@@ -154,6 +182,19 @@ func (manager *controlAttemptManager) create(request recording.AttemptRequest) (
 	go manager.run(ctx, attempt, request)
 	manager.mu.Unlock()
 	return manager.awaitStartup(attempt)
+}
+
+func canReplaceFailedAttempt(
+	existing *controlAttempt,
+	request recording.AttemptRequest,
+	replacementFingerprint [sha256.Size]byte,
+) bool {
+	return existing.captureProtocolVersion == recording.CaptureProtocolVersion &&
+		request.ProtocolVersion == recording.CaptureProtocolVersion &&
+		existing.replacementFingerprint == replacementFingerprint &&
+		request.AttemptID != existing.identity.attemptID &&
+		request.CaptureGeneration > existing.captureGeneration &&
+		request.CaptureStartedAt == existing.captureStartedAt
 }
 
 func v2AttemptFenceChanged(existing *controlAttempt, request recording.AttemptRequest) bool {
@@ -187,7 +228,17 @@ func (manager *controlAttemptManager) awaitStartup(attempt *controlAttempt) (str
 func (manager *controlAttemptManager) startupResult(attempt *controlAttempt) (string, error) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	return attempt.state, attempt.startupErr
+	if attempt.startupErr != nil {
+		return attempt.state, attempt.startupErr
+	}
+	if attempt.state == "failed" {
+		code := attempt.failureCode
+		if code == "" {
+			code = "BOT_RUNTIME_EXITED"
+		}
+		return attempt.state, &failedAttemptError{code: code}
+	}
+	return attempt.state, nil
 }
 
 func (manager *controlAttemptManager) run(
@@ -217,20 +268,32 @@ func (manager *controlAttemptManager) run(
 	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if !attempt.startupResolved {
-		manager.resolveStartupLocked(attempt, errStartupFailed)
-	}
 	if manager.attempts[attempt.identity.recordingID] == attempt {
-		if runErr != nil {
-			attempt.failureCode = botFailureCode(runErr)
-		}
-		if (attempt.stopRequested && runErr == nil) || cleanCompletion || attempt.startupErr != nil {
-			delete(manager.attempts, attempt.identity.recordingID)
-		} else {
+		preReadyExit := !attempt.startupResolved && !attempt.stopRequested
+		unexpectedExit := preReadyExit || runErr != nil ||
+			(!attempt.stopRequested && !cleanCompletion)
+		if unexpectedExit {
 			attempt.state = "failed"
+			attempt.stopFailed = attempt.stopRequested
+			attempt.failureCode = botFailureCode(runErr)
 			if attempt.failureCode == "" {
 				attempt.failureCode = "BOT_RUNTIME_EXITED"
 			}
+		}
+		if !attempt.startupResolved {
+			manager.resolveStartupLocked(attempt, errStartupFailed)
+		}
+		if !unexpectedExit {
+			delete(manager.attempts, attempt.identity.recordingID)
+		} else {
+			slog.Error(
+				"recording capture attempt failed",
+				"recordingId", attempt.identity.recordingID,
+				"roomId", attempt.identity.roomID,
+				"attemptState", attempt.state,
+				"failureCode", attempt.failureCode,
+				"error", runErr,
+			)
 		}
 	}
 	close(attempt.done)
@@ -248,7 +311,9 @@ func botFailureCode(err error) string {
 		return "BOT_SIGNALING_GAP"
 	case errors.Is(err, recording.ErrFinalizationFailed):
 		return "BOT_FINALIZATION_FAILED"
-	case errors.Is(err, recording.ErrCaptureIncomplete), errors.Is(err, recording.ErrCaptureMaximumDuration):
+	case errors.Is(err, recording.ErrCaptureIncomplete),
+		errors.Is(err, recording.ErrCaptureMediaUnavailable),
+		errors.Is(err, recording.ErrCaptureMaximumDuration):
 		return "BOT_CAPTURE_INCOMPLETE"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "BOT_CONNECT_TIMEOUT"
@@ -297,6 +362,14 @@ func (manager *controlAttemptManager) stop(recordingID string) (string, error) {
 	select {
 	case <-done:
 		manager.mu.Lock()
+		if manager.attempts[recordingID] == attempt && attempt.stopFailed {
+			code := attempt.failureCode
+			if code == "" {
+				code = "BOT_RUNTIME_EXITED"
+			}
+			manager.mu.Unlock()
+			return attempt.state, &failedAttemptError{code: code}
+		}
 		if manager.attempts[recordingID] == attempt {
 			delete(manager.attempts, recordingID)
 		}
@@ -308,11 +381,17 @@ func (manager *controlAttemptManager) stop(recordingID string) (string, error) {
 }
 
 func (manager *controlAttemptManager) snapshots() []AttemptSnapshot {
+	return manager.healthSnapshot().attempts
+}
+
+func (manager *controlAttemptManager) healthSnapshot() controlHealthSnapshot {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	result := make([]AttemptSnapshot, 0, len(manager.attempts))
+	attempts := make([]AttemptSnapshot, 0, len(manager.attempts))
+	activeRecordingIDs := map[string]struct{}{}
+	occupiedSlots := 0
 	for _, attempt := range manager.attempts {
-		result = append(result, AttemptSnapshot{
+		attempts = append(attempts, AttemptSnapshot{
 			RecordingID: attempt.identity.recordingID,
 			RoomID:      attempt.identity.roomID,
 			AttemptID:   attempt.identity.attemptID,
@@ -321,17 +400,29 @@ func (manager *controlAttemptManager) snapshots() []AttemptSnapshot {
 			FailureCode: attempt.failureCode,
 			Evidence:    attempt.evidence,
 		})
+		if attempt.state == "starting" || attempt.state == "capturing" || attempt.state == "stopping" {
+			activeRecordingIDs[attempt.identity.recordingID] = struct{}{}
+			occupiedSlots++
+		}
 	}
-	sort.Slice(result, func(left, right int) bool {
-		return result[left].RecordingID < result[right].RecordingID
+	sort.Slice(attempts, func(left, right int) bool {
+		return attempts[left].RecordingID < attempts[right].RecordingID
 	})
-	return result
+	pendingFinalizations := make([]string, 0, len(manager.pendingFinalizations))
+	for recordingID := range manager.pendingFinalizations {
+		pendingFinalizations = append(pendingFinalizations, recordingID)
+	}
+	sort.Strings(pendingFinalizations)
+	return controlHealthSnapshot{
+		attempts:             attempts,
+		activeRecordingIDs:   activeRecordingIDs,
+		pendingFinalizations: pendingFinalizations,
+		occupiedSlots:        occupiedSlots,
+	}
 }
 
 func (manager *controlAttemptManager) occupiedSlots() int {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	return manager.occupiedSlotsLocked()
+	return manager.healthSnapshot().occupiedSlots
 }
 
 func (manager *controlAttemptManager) occupiedSlotsLocked() int {
@@ -453,19 +544,24 @@ func (manager *controlAttemptManager) runFinalization(
 	if manager.pendingFinalizations[recordingID] == operation {
 		delete(manager.pendingFinalizations, recordingID)
 	}
+	if err == nil {
+		if attempt := manager.attempts[recordingID]; attempt != nil && attempt.state == "failed" {
+			delete(manager.attempts, recordingID)
+		}
+	} else {
+		slog.Error(
+			"recording capture finalization failed",
+			"recordingId", recordingID,
+			"attemptState", "finalizing",
+			"failureCode", "BOT_FINALIZATION_FAILED",
+		)
+	}
 	close(operation.done)
 	manager.mu.Unlock()
 }
 
 func (manager *controlAttemptManager) finalizations() []string {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	result := make([]string, 0, len(manager.pendingFinalizations))
-	for recordingID := range manager.pendingFinalizations {
-		result = append(result, recordingID)
-	}
-	sort.Strings(result)
-	return result
+	return manager.healthSnapshot().pendingFinalizations
 }
 
 func fingerprintRequest(request recording.AttemptRequest) ([sha256.Size]byte, error) {
@@ -481,6 +577,14 @@ func fingerprintRequestWithoutV2Fence(
 ) ([sha256.Size]byte, error) {
 	request.CaptureGeneration = 0
 	request.CaptureStartedAt = ""
+	return fingerprintRequest(request)
+}
+
+func fingerprintReplacementIdentity(request recording.AttemptRequest) ([sha256.Size]byte, error) {
+	request.AttemptID = ""
+	request.Admission = ""
+	request.WorkerGenerationID = ""
+	request.CaptureGeneration = 0
 	return fingerprintRequest(request)
 }
 

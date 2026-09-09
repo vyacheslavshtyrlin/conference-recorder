@@ -86,7 +86,7 @@ func seededSpoolGeneration(t *testing.T, root string) (*DurableSpool, string) {
 	digest := sha256.Sum256(bytes)
 	staging := writeTestStaging(t, root, "old.part", bytes)
 	descriptor := fixtureSegmentDescriptor(int64(len(bytes)), hex.EncodeToString(digest[:]))
-	segment, err := spool.StoreSegment(context.Background(), "rec-1", descriptor, staging)
+	segment, err := spool.StoreSegment(context.Background(), testMutationFence(), descriptor, staging)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestDurableSpoolRejectsSymlinkedDirectoryChain(t *testing.T) {
 				}
 				_, err = spool.StoreSegment(
 					context.Background(),
-					"rec-1",
+					testMutationFence(),
 					fixtureSegmentDescriptor(int64(len(payload)), hex.EncodeToString(digest[:])),
 					staging,
 				)
@@ -226,7 +226,7 @@ func TestStoreSegmentRejectsAndPreservesFileOutsideRecordingStaging(t *testing.T
 	}
 	if _, err := spool.StoreSegment(
 		context.Background(),
-		"rec-1",
+		testMutationFence(),
 		fixtureSegmentDescriptor(int64(len(payload)), hex.EncodeToString(digest[:])),
 		outside,
 	); err == nil {
@@ -249,7 +249,7 @@ func TestManifestMutationsPublishOnlyDurableState(t *testing.T) {
 		}
 		return nil
 	}
-	if err := spool.MarkCommitted("rec-1", segment.CaptureGeneration, segment.TrackID, segment.Sequence, "upload-1"); !errors.Is(err, injected) {
+	if err := spool.MarkCommitted(testMutationFence(), segment.TrackID, segment.Sequence, "upload-1"); !errors.Is(err, injected) {
 		t.Fatalf("MarkCommitted did not surface persist failure: %v", err)
 	}
 	afterCommit, _ := spool.Snapshot("rec-1")
@@ -260,7 +260,7 @@ func TestManifestMutationsPublishOnlyDurableState(t *testing.T) {
 	records := []CheckpointRecord{}
 	hash, _ := canonicalCheckpointHash(1, 1, records)
 	checkpoint := GenerationCheckpoint{CaptureGeneration: 1, CheckpointSequence: 0, TimelineThroughMS: 1, PayloadSHA256: hash}
-	if err := spool.StoreCheckpoint("rec-1", checkpoint, records); !errors.Is(err, injected) {
+	if err := spool.StoreCheckpoint(testMutationFence(), checkpoint, records); !errors.Is(err, injected) {
 		t.Fatalf("StoreCheckpoint did not surface persist failure: %v", err)
 	}
 	afterCheckpoint, _ := spool.Snapshot("rec-1")
@@ -269,7 +269,7 @@ func TestManifestMutationsPublishOnlyDurableState(t *testing.T) {
 	}
 
 	spool.failpoint = nil
-	if err := spool.MarkCommitted("rec-1", segment.CaptureGeneration, segment.TrackID, segment.Sequence, "upload-1"); err != nil {
+	if err := spool.MarkCommitted(testMutationFence(), segment.TrackID, segment.Sequence, "upload-1"); err != nil {
 		t.Fatal(err)
 	}
 	spool.failpoint = func(phase string) error {
@@ -278,7 +278,7 @@ func TestManifestMutationsPublishOnlyDurableState(t *testing.T) {
 		}
 		return nil
 	}
-	if err := spool.RemoveCommitted("rec-1"); !errors.Is(err, injected) {
+	if err := spool.RemoveCommitted(testMutationFence()); !errors.Is(err, injected) {
 		t.Fatalf("RemoveCommitted did not surface persist failure: %v", err)
 	}
 	afterRemove, _ := spool.Snapshot("rec-1")
@@ -333,7 +333,7 @@ func TestStoreSegmentPersistFailureNeverLeavesDirtyCachedSuccess(t *testing.T) {
 			}
 			if _, err := spool.StoreSegment(
 				context.Background(),
-				"rec-1",
+				testMutationFence(),
 				descriptor,
 				staging,
 			); !errors.Is(err, injected) {
@@ -345,7 +345,7 @@ func TestStoreSegmentPersistFailureNeverLeavesDirtyCachedSuccess(t *testing.T) {
 			spool.failpoint = nil
 			segment, err := spool.StoreSegment(
 				context.Background(),
-				"rec-1",
+				testMutationFence(),
 				descriptor,
 				staging,
 			)
@@ -375,7 +375,7 @@ func TestSealedManifestLeavesRecoveryHealthAfterRestart(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := spool.MarkSealed("rec-1"); err != nil {
+	if err := spool.MarkSealed(testMutationFence()); err != nil {
 		t.Fatal(err)
 	}
 	restarted, _ := NewDurableSpool(root, 1_000_000)
@@ -386,6 +386,38 @@ func TestSealedManifestLeavesRecoveryHealthAfterRestart(t *testing.T) {
 	manifest, err := restarted.loadLocked("rec-1")
 	if err != nil || manifest.Status != "sealed" {
 		t.Fatalf("sealed status was not durable: %+v %v", manifest, err)
+	}
+}
+
+func TestFailedManifestLeavesRecoveryHealthAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	spool, err := NewDurableSpool(root, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.Begin(
+		context.Background(),
+		AttemptFence{"attempt-1", "rec-1", "worker-1", "process-1"},
+		1,
+		"2026-08-25T10:00:00Z",
+		"seal-only",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := spool.MarkFailed(testMutationFence()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewDurableSpool(root, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverable, finalizations, err := restarted.RecoveryHealth()
+	if err != nil || len(recoverable) != 0 || len(finalizations) != 0 {
+		t.Fatalf("failed recording remained unhealthy: %v %v %v", recoverable, finalizations, err)
+	}
+	manifest, err := restarted.loadLocked("rec-1")
+	if err != nil || manifest.Status != "failed" {
+		t.Fatalf("failed status was not durable: %+v %v", manifest, err)
 	}
 }
 
@@ -413,8 +445,7 @@ func TestRemoveCommittedSurfacesDirectorySyncFailureAndRetries(t *testing.T) {
 	}
 	segment := manifest.Segments[0]
 	if err := spool.MarkCommitted(
-		"rec-1",
-		segment.CaptureGeneration,
+		testMutationFence(),
 		segment.TrackID,
 		segment.Sequence,
 		"upload-1",
@@ -428,11 +459,11 @@ func TestRemoveCommittedSurfacesDirectorySyncFailureAndRetries(t *testing.T) {
 		}
 		return nil
 	}
-	if err := spool.RemoveCommitted("rec-1"); !errors.Is(err, injected) {
+	if err := spool.RemoveCommitted(testMutationFence()); !errors.Is(err, injected) {
 		t.Fatalf("directory sync failure was not surfaced: %v", err)
 	}
 	spool.failpoint = nil
-	if err := spool.RemoveCommitted("rec-1"); err != nil {
+	if err := spool.RemoveCommitted(testMutationFence()); err != nil {
 		t.Fatalf("directory sync retry did not converge: %v", err)
 	}
 }
@@ -477,14 +508,14 @@ func TestDurableSpoolPersistsAndRecoversClosedSegment(t *testing.T) {
 	digest := sha256.Sum256(bytes)
 	staging := writeTestStaging(t, root, "segment.part", bytes)
 	descriptor := fixtureSegmentDescriptor(int64(len(bytes)), hex.EncodeToString(digest[:]))
-	stored, err := spool.StoreSegment(context.Background(), "rec-1", descriptor, staging)
+	stored, err := spool.StoreSegment(context.Background(), testMutationFence(), descriptor, staging)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.LocalPath == "" || stored.Committed {
 		t.Fatalf("unexpected stored segment: %+v", stored)
 	}
-	if err := spool.MarkCommitted("rec-1", 1, descriptor.TrackID, 0, "upload-1"); err != nil {
+	if err := spool.MarkCommitted(testMutationFence(), descriptor.TrackID, 0, "upload-1"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -513,7 +544,7 @@ func TestDurableSpoolFailsClosedOnChecksumConflictAndBound(t *testing.T) {
 	}
 	staging := writeTestStaging(t, root, "segment.part", []byte("wrong"))
 	descriptor := fixtureSegmentDescriptor(7, string(make([]byte, 64)))
-	if _, err := spool.StoreSegment(context.Background(), "rec-1", descriptor, staging); err == nil {
+	if _, err := spool.StoreSegment(context.Background(), testMutationFence(), descriptor, staging); err == nil {
 		t.Fatal("expected checksum conflict")
 	}
 }
@@ -543,14 +574,14 @@ func TestStagingCleanupAndTreeBoundIncludeCrashLeftovers(t *testing.T) {
 	}
 	first := filepath.Join(staging, "first.part")
 	second := filepath.Join(staging, "second.part")
-	if err := spool.ResizeStaging("rec-1", first, 600_000); err != nil {
+	if err := spool.ResizeStaging(testMutationFence(), first, 600_000); err != nil {
 		t.Fatal(err)
 	}
-	if err := spool.ResizeStaging("rec-1", second, 500_000); err == nil {
+	if err := spool.ResizeStaging(testMutationFence(), second, 500_000); err == nil {
 		t.Fatal("concurrent staging reservations exceeded the storage bound")
 	}
-	spool.ReleaseStaging("rec-1", first)
-	if err := spool.CleanupStaging("rec-1"); err != nil {
+	spool.ReleaseStaging(testMutationFence(), first)
+	if err := spool.CleanupStaging(testMutationFence()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
@@ -587,7 +618,7 @@ func TestConcurrentStagingReservationsNeverExceedBound(t *testing.T) {
 	for _, path := range paths {
 		go func() {
 			<-start
-			results <- spool.ResizeStaging("rec-1", path, 600_000)
+			results <- spool.ResizeStaging(testMutationFence(), path, 600_000)
 		}()
 	}
 	close(start)
@@ -606,10 +637,59 @@ func TestConcurrentStagingReservationsNeverExceedBound(t *testing.T) {
 	}
 
 	for _, path := range paths {
-		spool.ReleaseStaging("rec-1", path)
+		spool.ReleaseStaging(testMutationFence(), path)
 	}
-	if err := spool.ResizeStaging("rec-1", paths[0], 600_000); err != nil {
+	if err := spool.ResizeStaging(testMutationFence(), paths[0], 600_000); err != nil {
 		t.Fatalf("released capacity was not reusable: %v", err)
+	}
+}
+
+func TestHigherGenerationFencesStaleSpoolMutations(t *testing.T) {
+	root := t.TempDir()
+	spool, err := NewDurableSpool(root, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := "2026-08-25T10:00:00.000Z"
+	oldAttempt := AttemptFence{
+		AttemptID: "attempt-1", RecordingID: "rec-1",
+		WorkerID: "worker-1", WorkerGenerationID: "process-1",
+	}
+	if _, err := spool.Begin(context.Background(), oldAttempt, 1, startedAt, "capture"); err != nil {
+		t.Fatal(err)
+	}
+	oldFence := testMutationFence()
+	staging := filepath.Join(root, "capture-v2", "rec-1", "staging", "old.part")
+	if err := spool.ResizeStaging(oldFence, staging, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	newAttempt := AttemptFence{
+		AttemptID: "attempt-2", RecordingID: "rec-1",
+		WorkerID: "worker-1", WorkerGenerationID: "process-2",
+	}
+	if _, err := spool.Begin(context.Background(), newAttempt, 2, startedAt, "capture"); err != nil {
+		t.Fatal(err)
+	}
+	newFence := newSpoolMutationFence(newAttempt, 2)
+	if err := spool.CleanupStaging(oldFence); !errors.Is(err, ErrAttemptFenceMismatch) {
+		t.Fatalf("stale cleanup error=%v", err)
+	}
+	if err := spool.ResizeStaging(oldFence, staging, 1); !errors.Is(err, ErrAttemptFenceMismatch) {
+		t.Fatalf("stale reservation error=%v", err)
+	}
+	spool.ReleaseStaging(oldFence, staging)
+	if err := spool.CleanupStaging(newFence); err != nil {
+		t.Fatalf("replacement cleanup error=%v", err)
+	}
+	manifest, err := spool.Snapshot("rec-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.AttemptID != newAttempt.AttemptID ||
+		manifest.WorkerGenerationID != newAttempt.WorkerGenerationID ||
+		manifest.CaptureGeneration != 2 {
+		t.Fatalf("stale callback changed replacement owner: %+v", manifest)
 	}
 }
 
@@ -624,6 +704,16 @@ func writeTestStaging(t *testing.T, root, name string, payload []byte) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func testMutationFence() SpoolMutationFence {
+	return SpoolMutationFence{
+		AttemptID:          "attempt-1",
+		RecordingID:        "rec-1",
+		WorkerID:           "worker-1",
+		WorkerGenerationID: "process-1",
+		CaptureGeneration:  1,
+	}
 }
 
 func fixtureSegmentDescriptor(bytes int64, digest string) SegmentDescriptor {

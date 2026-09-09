@@ -22,6 +22,9 @@ type TimelineState struct {
 	records      []CheckpointRecord
 	participants map[string]string
 	producers    map[string]string
+	// A pending track deliberately blocks non-final checkpoints past its start:
+	// publishing a later source gap after such a checkpoint would rewrite history.
+	pendingTrackCoverage map[string]int64
 }
 
 func NewTimelineState(recordingID string) (*TimelineState, error) {
@@ -29,10 +32,11 @@ func NewTimelineState(recordingID string) (*TimelineState, error) {
 		return nil, errors.New("recording ID is required for timeline")
 	}
 	return &TimelineState{
-		recordingID:  recordingID,
-		participants: map[string]string{},
-		producers:    map[string]string{},
-		records:      []CheckpointRecord{},
+		recordingID:          recordingID,
+		participants:         map[string]string{},
+		producers:            map[string]string{},
+		pendingTrackCoverage: map[string]int64{},
+		records:              []CheckpointRecord{},
 	}, nil
 }
 
@@ -54,6 +58,7 @@ func (timeline *TimelineState) Restore(recovery RecoveryState) error {
 		return err
 	}
 	timeline.records = records
+	timeline.pendingTrackCoverage = map[string]int64{}
 	return nil
 }
 
@@ -66,7 +71,18 @@ func (timeline *TimelineState) CheckpointBoundary(requestedMS int64, closeOpen b
 	if closeOpen {
 		return requestedMS, nil
 	}
+	for _, startMS := range timeline.pendingTrackCoverage {
+		if startMS < requestedMS {
+			return 0, ErrCheckpointBoundaryUnavailable
+		}
+	}
 	for _, record := range timeline.records {
+		if record.EndMS != nil && *record.EndMS > requestedMS {
+			return 0, ErrCheckpointBoundaryUnavailable
+		}
+		if record.StartMS != nil && *record.StartMS > requestedMS {
+			return 0, ErrCheckpointBoundaryUnavailable
+		}
 		isInterval := record.Category == "participantIntervals" || record.Category == "trackIntervals"
 		if !isInterval || record.EndMS != nil || record.StartMS == nil {
 			continue
@@ -370,6 +386,73 @@ func (timeline *TimelineState) TrackForProducer(producerID string) (string, stri
 		}
 	}
 	return trackID, timeline.trackOwnerLocked(trackID), true
+}
+
+func (timeline *TimelineState) ActiveTrackStart(trackID string) (int64, bool) {
+	timeline.mu.Lock()
+	defer timeline.mu.Unlock()
+	for index := len(timeline.records) - 1; index >= 0; index-- {
+		record := timeline.records[index]
+		if record.Category != "trackIntervals" || record.TrackID != trackID || record.EndMS != nil {
+			continue
+		}
+		if record.State != "active" || record.StartMS == nil {
+			return 0, false
+		}
+		return *record.StartMS, true
+	}
+	return 0, false
+}
+
+func (timeline *TimelineState) BeginTrackCoverage(trackID string, startMS int64) error {
+	timeline.mu.Lock()
+	defer timeline.mu.Unlock()
+	if !validOpaqueID(trackID, "trk_") || startMS < 0 {
+		return errors.New("invalid pending track coverage")
+	}
+	if existing, exists := timeline.pendingTrackCoverage[trackID]; exists {
+		if existing != startMS {
+			return errors.New("pending track coverage start conflicts")
+		}
+		return nil
+	}
+	timeline.pendingTrackCoverage[trackID] = startMS
+	return nil
+}
+
+func (timeline *TimelineState) ResolveTrackCoverage(trackID string, startMS, endMS int64) error {
+	timeline.mu.Lock()
+	defer timeline.mu.Unlock()
+	return timeline.resolveTrackCoverageLocked(trackID, &startMS, endMS)
+}
+
+func (timeline *TimelineState) ResolvePendingTrackCoverage(trackID string, endMS int64) error {
+	timeline.mu.Lock()
+	defer timeline.mu.Unlock()
+	return timeline.resolveTrackCoverageLocked(trackID, nil, endMS)
+}
+
+func (timeline *TimelineState) resolveTrackCoverageLocked(trackID string, expectedStart *int64, endMS int64) error {
+	startMS, exists := timeline.pendingTrackCoverage[trackID]
+	if !exists {
+		return nil
+	}
+	if expectedStart != nil && startMS != *expectedStart {
+		return errors.New("pending track coverage start conflicts")
+	}
+	if endMS < startMS {
+		return errors.New("pending track coverage end regressed")
+	}
+	delete(timeline.pendingTrackCoverage, trackID)
+	if endMS == startMS {
+		return nil
+	}
+	start, end := startMS, endMS
+	timeline.records = append(timeline.records, CheckpointRecord{
+		Category: "gaps", TrackID: trackID, StartMS: &start, EndMS: &end,
+		Scope: "track", Reason: "source_unavailable",
+	})
+	return nil
 }
 
 func (timeline *TimelineState) RecordsThrough(throughMS int64, closeOpen bool) ([]CheckpointRecord, error) {

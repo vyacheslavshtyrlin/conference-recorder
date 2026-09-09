@@ -6,6 +6,7 @@ import {
   compileSilentAudioFilter,
   compileV2StagingPlan,
   stagedOutputEncodingArguments,
+  videoSeekLookbackMs,
   type CaptureV2Manifest,
   type ManifestSegment,
 } from "./compositionV2.js";
@@ -79,6 +80,13 @@ export async function executeV2Composition(
           "-map", "[vout]",
           ...losslessH264VideoArguments(),
           ...hardFileLimit(passLimit), next,
+        ],
+        [
+          undefined,
+          ...pass.sourceSegments.map((segment) => Math.max(
+            0,
+            (scene.startMs - segment.startMs - videoSeekLookbackMs) / 1_000,
+          )),
         ],
       );
       await assertIntermediate(next, options.maximumIntermediateBytes);
@@ -251,6 +259,7 @@ async function runFilterStage(
   inputs: string[],
   filtergraph: string,
   outputArguments: string[],
+  inputSeekSeconds?: Array<number | undefined>,
 ): Promise<void> {
   const bytes = Buffer.byteLength(filtergraph, "utf8");
   if (bytes > maximumFiltergraphBytes)
@@ -260,7 +269,10 @@ async function runFilterStage(
   try {
     await runFFmpeg(options, [
       "-hide_banner", "-loglevel", "error", "-y",
-      ...inputs.flatMap((path) => ["-i", path]),
+      ...inputs.flatMap((path, index) => {
+        const seek = inputSeekSeconds?.[index];
+        return seek && seek > 0 ? ["-ss", seconds(seek), "-i", path] : ["-i", path];
+      }),
       "-filter_complex_script", script,
       ...outputArguments,
     ]);

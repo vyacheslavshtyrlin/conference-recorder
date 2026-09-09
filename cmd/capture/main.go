@@ -37,6 +37,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	logger := newLogger(config.LogLevel)
+	slog.SetDefault(logger)
 	foundation, err := recording.NewProductionFoundation(config)
 	if err != nil {
 		return err
@@ -86,7 +88,6 @@ func run() error {
 		WriteTimeout:      0,
 		IdleTimeout:       30 * time.Second,
 	}
-	logger := newLogger(config.LogLevel)
 	logger.Info(
 		"recording capture started",
 		"workerId",

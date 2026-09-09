@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
+import { CompositionFailure } from "./compositionFailure.js";
 import {
   escapeDrawText,
   gridGeometry,
@@ -57,7 +58,17 @@ export type ManifestPage = {
   nextCursor: string | null;
 };
 
-export class RetryableSourceDownloadError extends Error {}
+export class RetryableSourceDownloadError extends CompositionFailure {
+  constructor(_message: string, options?: ErrorOptions) {
+    super(
+      "SOURCE_DOWNLOAD_INTERRUPTED",
+      "source",
+      true,
+      "Source download was interrupted",
+      options,
+    );
+  }
+}
 export type CaptureV2Manifest = Omit<ManifestPage, "nextCursor">;
 
 const categories = [
@@ -219,6 +230,9 @@ function validateCompleteManifest(
   validateNonOverlapping(manifest.trackIntervals, (item) => item.trackId);
   validateNonOverlapping(manifest.segments, (item) => item.trackId);
   validateSegmentPlacement(manifest);
+  if (manifest.segments.length === 0) {
+    validateZeroMediaTimeline(manifest);
+  }
   const sourceBytes = manifest.segments.reduce(
     (total, segment) => total + segment.expectedBytes,
     0,
@@ -227,6 +241,12 @@ function validateCompleteManifest(
     throw new Error("v2 manifest source byte bound exceeded");
   }
   return manifest;
+}
+
+function validateZeroMediaTimeline(manifest: CaptureV2Manifest): void {
+  if (manifest.timelineEndMs <= 0 || manifest.participantIntervals.length === 0) {
+    throw new Error("zero-media v2 manifest has no authoritative participant timeline");
+  }
 }
 
 function validateInterval(
@@ -343,8 +363,11 @@ export async function downloadBoundedSource(
   segment: ManifestSegment,
   path: string,
 ): Promise<void> {
-  if (!response.ok || !response.body) {
+  if (!response.ok) {
     throw new Error(`segment download failed: ${response.status}`);
+  }
+  if (!response.body) {
+    throw new RetryableSourceDownloadError("segment download body is absent");
   }
   const declared = response.headers.get("content-length");
   if (declared !== null && Number(declared) !== segment.expectedBytes) {
@@ -389,16 +412,30 @@ export function verifySourceProbe(raw: string, segment: ManifestSegment, toleran
   const parsed = JSON.parse(raw) as {
     streams?: Array<{ codec_type?: string; codec_name?: string }>;
     format?: { duration?: string };
+    packets?: Array<{ pts_time?: string; duration_time?: string }>;
   };
   const expectedKind = segment.source === "mic" ? "audio" : "video";
   const stream = parsed.streams?.find((item) => item.codec_type === expectedKind);
-  const duration = Number(parsed.format?.duration);
+  const formatDuration = Number(parsed.format?.duration);
+  const packetBounds = (parsed.packets ?? []).map((packet) => {
+    const start = Number(packet.pts_time);
+    const packetDuration = Number(packet.duration_time ?? 0);
+    return { start, end: start + packetDuration };
+  }).filter(({ start, end }) => Number.isFinite(start) && Number.isFinite(end));
+  const packetDuration = packetBounds.length > 0
+    ? Math.max(...packetBounds.map(({ end }) => end)) - Math.min(...packetBounds.map(({ start }) => start))
+    : Number.NaN;
+  const hasContainerDuration = Number.isFinite(formatDuration);
+  const duration = hasContainerDuration ? formatDuration : packetDuration;
   const expectedDuration = (segment.endMs - segment.startMs) / 1_000;
+  const durationTolerance = hasContainerDuration
+    ? toleranceSeconds
+    : Math.max(toleranceSeconds, expectedDuration * 0.15);
   const invalidProbe = !stream
     || stream.codec_name !== segment.codec
     || !Number.isFinite(duration)
-    || duration < expectedDuration - toleranceSeconds
-    || duration > expectedDuration + toleranceSeconds;
+    || duration < expectedDuration - durationTolerance
+    || duration > expectedDuration + durationTolerance;
   if (invalidProbe) {
     throw new Error("v2 source probe verification failed");
   }
@@ -493,6 +530,7 @@ export type V2StagingPlan = { scenes: StagedScenePlan[] };
 
 const maximumVideoSourcesPerPass = 63;
 const maximumAudioSourcesPerGroup = 64;
+export const videoSeekLookbackMs = 1_000;
 
 export function compileV2StagingPlan(manifest: CaptureV2Manifest): V2StagingPlan {
   const segments = [...manifest.segments].sort(compareSegments);
@@ -572,7 +610,12 @@ function compileSceneVideoPasses(
   manifest: CaptureV2Manifest,
   scene: ElementaryScene,
 ): VideoOverlayPass[] {
-  const duration = seconds((scene.endMs - scene.startMs) / 1_000);
+  const durationMs = scene.endMs - scene.startMs;
+  const duration = seconds(durationMs / 1_000);
+  // Sub-frame scenes cannot carry a distinct 24-fps visual state. Reusing the
+  // already-rendered base avoids a header-only framesync output when even a
+  // generated avatar overlay has no timestamp in this interval.
+  if (durationMs < Math.ceil(1_000 / 24)) return [];
   const passes: VideoOverlayPass[] = [];
   let filters: string[] = [];
   let sources: ManifestSegment[] = [];
@@ -608,12 +651,18 @@ function compileSceneVideoPasses(
     const input = sources.length;
     const media = `p${passIndex}media${layer++}`;
     const next = `p${passIndex}layer${layer++}`;
-    const offset = seconds((scene.startMs - segment.startMs) / 1_000);
+    const offsetMs = scene.startMs - segment.startMs;
+    const lookbackMs = Math.min(offsetMs, videoSeekLookbackMs);
+    const offset = seconds(lookbackMs / 1_000);
+    const padding = seconds((lookbackMs + durationMs) / 1_000);
     const scale = contain
       ? `scale=${geometry.width}:${geometry.height}:force_original_aspect_ratio=decrease,pad=${geometry.width}:${geometry.height}:(ow-iw)/2:(oh-ih)/2`
       : `scale=${geometry.width}:${geometry.height}:force_original_aspect_ratio=increase,crop=${geometry.width}:${geometry.height}`;
-    filters.push(`[${input}:v]trim=start=${offset}:duration=${duration},setpts=PTS-STARTPTS,${scale}[${media}]`);
-    filters.push(`[${current}][${media}]overlay=x=${geometry.x}:y=${geometry.y}[${next}]`);
+    filters.push(`[${input}:v]tpad=stop_mode=clone:stop_duration=${padding},trim=start=${offset}:duration=${duration},setpts=PTS-STARTPTS,${scale}[${media}]`);
+    // The executor seeks to at most one second before the scene. Padding before
+    // this residual trim preserves a final decoded frame across an accepted
+    // terminal tail without making framesync scan the whole segment prefix.
+    filters.push(`[${current}][${media}]overlay=x=${geometry.x}:y=${geometry.y}:eof_action=pass[${next}]`);
     current = next;
   };
 

@@ -89,6 +89,14 @@ func (reconciler *Reconciler) Producers() []Producer {
 	return result
 }
 
+func (reconciler *Reconciler) participantsSnapshot() []Participant {
+	result := make([]Participant, 0, len(reconciler.participants))
+	for _, participant := range reconciler.participants {
+		result = append(result, participant)
+	}
+	return result
+}
+
 // Apply accepts exact duplicate delivery but fails closed on a gap or a
 // conflicting duplicate.
 func (reconciler *Reconciler) Apply(event Event) (bool, error) {

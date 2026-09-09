@@ -218,6 +218,29 @@ func TestProbeRunReturnsTypedAuthoritativeStop(t *testing.T) {
 	}
 }
 
+func TestProbeRunCancellationDefersTransportTeardownToClose(t *testing.T) {
+	signaling := newFixtureSignaling()
+	peer := &fixturePeer{}
+	controller, err := StartProbe(context.Background(), signaling, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := controller.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled probe returned %v", err)
+	}
+	if peer.closed || signaling.closed {
+		t.Fatal("root cancellation tore down capture transport before session finalization")
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !peer.closed || !signaling.closed {
+		t.Fatal("explicit close did not release capture transport")
+	}
+}
+
 func TestAuthoritativeStopLocalTeardownIgnoresDeletedRemoteConsumers(t *testing.T) {
 	signaling := newFixtureSignaling()
 	signaling.closeErr = errors.New("consumer not found")

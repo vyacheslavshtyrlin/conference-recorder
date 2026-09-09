@@ -38,8 +38,45 @@ func TestPionAcceptsMediasoupICELiteOffer(t *testing.T) {
 	if !strings.Contains(answer, "a=ice-ufrag:") {
 		t.Fatal("Pion answer did not contain local ICE parameters")
 	}
-	if dtls.Role != "client" || len(dtls.Fingerprints) == 0 {
+	if dtls.Role != "server" || len(dtls.Fingerprints) == 0 {
 		t.Fatalf("unexpected DTLS parameters: %+v", dtls)
+	}
+}
+
+func TestExtractDTLSParametersUsesAnswerSetupRole(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup string
+		role  string
+	}{
+		{name: "active endpoint", setup: "active", role: "client"},
+		{name: "passive endpoint", setup: "passive", role: "server"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parameters, err := ExtractDTLSParameters(
+				"v=0\r\na=fingerprint:sha-256 AA:BB\r\na=setup:" + test.setup + "\r\n",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parameters.Role != test.role {
+				t.Fatalf("unexpected role: got %q want %q", parameters.Role, test.role)
+			}
+		})
+	}
+}
+
+func TestExtractDTLSParametersRejectsMissingOrAmbiguousSetupRole(t *testing.T) {
+	tests := []string{
+		"v=0\r\na=fingerprint:sha-256 AA:BB\r\n",
+		"v=0\r\na=fingerprint:sha-256 AA:BB\r\na=setup:actpass\r\n",
+		"v=0\r\na=fingerprint:sha-256 AA:BB\r\na=setup:active\r\na=setup:passive\r\n",
+	}
+	for _, answer := range tests {
+		if _, err := ExtractDTLSParameters(answer); err == nil {
+			t.Fatalf("invalid answer was accepted: %q", answer)
+		}
 	}
 }
 
