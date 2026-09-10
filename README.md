@@ -1,187 +1,367 @@
-# Recording workers
+# Recording bot
 
-This is the canonical recording deployment repository. It contains the E13
-production Go/Pion track-capture implementation and the Node composition worker
-under `composition/`. The existing GitLab pipeline builds one deploy image;
-Compose runs that image as separate capture and composition containers with
-different commands, credentials, volumes and resource limits. Chromium capture
-and the temporary Go service aliases have been removed.
+`recording-bot` — приватный контур записи конференций на Go/Pion WebRTC.
+Он не является участником комнаты, не отображается в списке участников и не
+поддерживает комнату активной.
 
-The spike proves at code level that:
+В одном репозитории и одном Docker-образе запускаются два независимых процесса:
 
-- mediasoup ICE-lite transport and consumer parameters can be represented as a
-  remote SDP offer accepted by Pion, with Pion DTLS parameters extracted for
-  `bot:connectRecvTransport`;
-- Pion receives Opus, VP8 and H.264 RTP on localhost and sends RTCP PLI for both
-  video codecs;
-- the unchanged `recording-bot.v1` request order is
-  capabilities, create transport, snapshot, consume, connect, resume and PLI;
-- the asynchronous WebSocket implementation correlates request IDs, accepts a
-  snapshot event before the `bot:syncSnapshot` response, delivers lifecycle
-  events in socket order and closes on controller-detected gap/conflict;
-- snapshots and lifecycle revisions reconcile camera and screen
-  start/stop/replacement, while gaps, conflicting duplicates, overlapping
-  replacements and unsupported codec tuples fail explicitly;
-- canonical v2 opaque participant and logical-track IDs remain stable across a
-  reconnect or producer replacement without persisting raw v1 IDs.
+- `recording-capture-*` — receive-only Go/Pion worker, который получает отдельные
+  аудио- и видеодорожки из mediasoup, формирует закрытые WebM/Matroska-сегменты и
+  загружает их прямо в private S3 по короткоживущим presigned URL от API;
+- `recording-composition` — Node.js/FFmpeg worker, который получает задачу у API,
+  скачивает сегменты, собирает и проверяет итоговый MP4, загружает его по
+  presigned URL и сообщает API о результате.
 
-Run from this directory:
+Chromium, browser capture и старый plain-RTP recorder удалены. Единственная
+production-реализация захвата — Go/Pion.
 
-```powershell
+## Схема работы
+
+```text
+Integration backend
+        |
+        | создаёт комнату с recordingRequested=true
+        v
+Conference API ---- PostgreSQL
+        |                 |
+        | metadata        | recording/job/artifact state
+        v                 |
+      Redis <-------------+
+        ^
+        |
+Signaling/media -- private control --> Go/Pion capture worker
+        |                                  |
+        | receive-only WebRTC              | presigned PUT
+        +---------------------------------> private S3
+                                               ^
+                                               |
+                                    composition worker
+                                               |
+                                               +--> verified MP4
+```
+
+Порядок запуска записи:
+
+1. Integration backend создаёт комнату с `recordingRequested: true`.
+2. Перед входом первого live-участника signaling резервирует свободный capture
+   slot. Если slot отсутствует, записываемая комната не запускается молча без
+   записи, а получает явную ошибку admission.
+3. Signaling выдаёт выбранному worker одноразовый bot admission и отправляет
+   generation-fenced команду запуска.
+4. Go/Pion worker подключается к приватному WebSocket signaling как receive-only
+   recorder и получает snapshot участников и дорожек.
+5. Каждая дорожка записывается независимо. Opus и VP8 упаковываются в WebM,
+   H.264 — в Matroska без перекодирования capture-потока.
+6. Закрытые сегменты сначала фиксируются в durable spool, затем загружаются в S3
+   по выданным API presigned URL и подтверждаются через private API.
+7. После закрытия комнаты capture worker запечатывает входные данные. Composition
+   worker получает lease, собирает MP4, проверяет результат и только после этого
+   API публикует состояние `READY`.
+
+## Границы безопасности
+
+- Capture и composition workers не получают `DATABASE_URL`.
+- Workers не получают постоянные S3 access key и secret key.
+- Capture и composition используют разные service secrets.
+- Команды signaling → capture подписываются отдельным короткоживущим JWT.
+- Media bytes не проходят через API и не сохраняются в Redis.
+- Private S3 bucket не публикуется напрямую для браузеров.
+- Незавершённые, повреждённые или конфликтующие данные не могут опубликовать
+  готовый артефакт.
+- Raw participant/producer IDs остаются в памяти capture-процесса; durable
+  timeline использует recording-scoped opaque IDs.
+
+## Production-топология
+
+Production Compose запускает:
+
+- пять независимо адресуемых контейнеров `recording-capture-1` …
+  `recording-capture-5`;
+- один контейнер `recording-composition`;
+- отдельный named volume для каждого процесса.
+
+Один capture slot соответствует одной одновременно записываемой комнате.
+При `RECORDING_BOT_MAX_SLOTS=10` каждый capture-контейнер обслуживает до десяти
+комнат, а суммарная настроенная capacity пяти worker-ов равна 50 записям.
+Это инфраструктурный лимит, а не продуктовый лимит комнат или участников.
+
+Для VM в одной приватной сети рекомендуется прямой межхостовый доступ:
+
+```text
+media     -> http://<private-recorder-ip>:8091..8095
+recorder  -> http://<private-api-ip>:3000
+recorder  -> ws://<private-media-ip>:4000/internal/recording-bot/v1
+recorder  -> https://storage.yandexcloud.net
+```
+
+Порты `8091`–`8095` должны быть разрешены только с private IP media-хоста.
+Публичный recorder nginx не требуется, если control plane полностью работает по
+private IP. HTTP/WS внутри приватной сети остаётся защищён service credentials;
+для дополнительной защиты можно использовать WireGuard или mTLS.
+
+## Переменные окружения
+
+Production pipeline принимает конфигурацию через защищённую GitLab File Variable
+`DEPLOY_ENV_PROD`. Production `.env` не создаётся в репозитории и не коммитится.
+
+### Обязательные переменные
+
+| Переменная | Назначение |
+| --- | --- |
+| `RECORDING_RUNTIME_ENV` | Режим security validation; в production — `production`. |
+| `RECORDING_API_INTERNAL_URL` | Базовый URL API без `/internal/v1`, например `http://10.0.0.10:3000`. |
+| `RECORDING_CAPTURE_SERVICE_SECRET` | Bearer credential capture worker для private API; совпадает с API. |
+| `RECORDING_COMPOSITION_SERVICE_SECRET` | Независимый credential composition worker; совпадает с API. |
+| `RECORDING_BOT_CONTROL_JWT_HS256_SECRET` | Секрет control JWT; совпадает с media. |
+| `RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS` | Общий hard deadline одного S3 PUT; совпадает с API. |
+
+Каждый secret должен содержать не менее 32 байт и не должен быть placeholder.
+Production startup отклоняет значения вида `replace-with`, `change-me`,
+`placeholder`, `example` и `local`.
+
+### Capture runtime
+
+| Переменная | Значение по умолчанию | Назначение |
+| --- | ---: | --- |
+| `RECORDING_BOT_BIND_HOST` | `0.0.0.0` | Адрес HTTP control server внутри контейнера. |
+| `RECORDING_BOT_PORT` | `8090` | Control-порт внутри контейнера. |
+| `RECORDING_BOT_BIND_ADDR` | `127.0.0.1` | Интерфейс host port publishing; для разных VM задаётся private IP recorder. |
+| `RECORDING_CAPTURE_PORT_1` … `_5` | `8091` … `8095` | Host control-порты пяти capture worker-ов. |
+| `RECORDING_BOT_MAX_SLOTS` | `10` в production Compose | Число одновременных записей одного worker, допустимый диапазон `1..32`. |
+| `RECORDING_BOT_START_TIMEOUT_MS` | `30000` | Максимальное время запуска attempt. |
+| `RECORDING_BOT_STOP_TIMEOUT_MS` | `30000` в production example | Максимальное время остановки attempt. |
+| `RECORDING_BOT_RECOVERY_TIMEOUT_MS` | `30000` | Максимальное время recovery. |
+| `RECORDING_STOP_GRACE_PERIOD` | `5m20s` | Grace period контейнера для корректного shutdown. |
+| `RECORDING_STORAGE_ROOT` | `/var/lib/conference-recording` | Приватный durable spool. |
+| `RECORDING_FFMPEG_TIMEOUT_MS` | `120000` | Таймаут capture FFmpeg subprocess. |
+| `RECORDING_MAX_SOURCE_BYTES` | `4000000000` | Максимальный объём source media одной записи. |
+| `RECORDING_MAX_DURATION_SECONDS` | `14400` | Максимальная продолжительность записи, 4 часа. |
+| `RECORDING_BOT_LOG_LEVEL` | `info` | `debug`, `info`, `warn` или `error`. |
+
+`RECORDING_BOT_WORKER_ID` и generation ID назначаются каждому контейнеру самим
+Compose/runtime. Их не нужно вручную дублировать в общем env-файле.
+
+### Composition runtime
+
+| Переменная | Значение по умолчанию | Назначение |
+| --- | ---: | --- |
+| `RECORDING_COMPOSITION_FFMPEG_TIMEOUT_MS` | `21600000` | Максимальное время FFmpeg composition, 6 часов. |
+| `RECORDING_COMPOSITION_HTTP_TIMEOUT_MS` | `120000` | Таймаут private API request. |
+| `RECORDING_COMPOSITION_STOP_GRACE_PERIOD` | `5m20s` | Grace period для завершения текущей операции. |
+| `RECORDING_FINALIZE_MAX_ATTEMPTS` | `3` | Число попыток финализации; совпадает с API. |
+| `RECORDING_FINALIZE_RETRY_DELAY_MS` | `250` | Задержка между попытками финализации. |
+| `RECORDING_COMPOSITION_PIDS_LIMIT` | `128` | Ограничение процессов composition container. |
+
+### Ресурсы
+
+| Переменная | Production preset | Область действия |
+| --- | ---: | --- |
+| `RECORDING_BOT_CPUS` | `6.0` | Каждый capture worker. |
+| `RECORDING_BOT_MEMORY_LIMIT` | `8g` | Каждый capture worker. |
+| `RECORDING_BOT_PIDS_LIMIT` | `512` | Каждый capture worker. |
+| `RECORDING_COMPOSITION_CPUS` | `2.0` | Composition worker. |
+| `RECORDING_COMPOSITION_MEMORY_LIMIT` | `4g` | Composition worker. |
+| `RECORDING_COMPOSITION_PIDS_LIMIT` | `128` | Composition worker. |
+
+При пяти capture worker-ах production preset допускает суммарно до 30 CPU и
+40 GB RAM для capture плюс 2 CPU и 4 GB RAM для composition. Фактическое число
+slot-ов должно подтверждаться нагрузочным тестом purchased host.
+
+## Совпадение секретов между сервисами
+
+| Recorder | Второй сервис | Правило |
+| --- | --- | --- |
+| `RECORDING_CAPTURE_SERVICE_SECRET` | одноимённая переменная API | Значения должны совпадать. |
+| `RECORDING_COMPOSITION_SERVICE_SECRET` | одноимённая переменная API | Значения должны совпадать. |
+| `RECORDING_BOT_CONTROL_JWT_HS256_SECRET` | одноимённая переменная media | Значения должны совпадать. |
+
+Эти три строки используют три разных независимых секрета. Redis, PostgreSQL,
+permanent S3 credentials, `JOIN_TOKEN_SECRET`, `ROOM_SESSION_TOKEN_SECRET` и
+`RECORDING_CONTROL_JWT_HS256_SECRET` recorder-контейнерам не передаются.
+
+## Health и control endpoints
+
+Capture worker предоставляет:
+
+- `GET /health/live` — liveness процесса без credentials;
+- `GET /health/ready` — authenticated readiness, capacity, generation и
+  recovery state;
+- `PUT /internal/v1/attempts/{recordingId}` — generation-fenced запуск;
+- `DELETE /internal/v1/attempts/{recordingId}` — bounded idempotent stop;
+- `PUT /internal/v1/finalizations/{recordingId}` — fenced финализация/recovery.
+
+Все endpoints, кроме liveness, требуют control JWT. Дополнительно worker
+проверяет `X-Recording-Worker-Id` и `X-Recording-Worker-Generation-Id` для
+операций изменения состояния.
+
+Docker healthcheck capture-контейнера использует только `/health/live`: он
+проверяет, что процесс отвечает, но не заявляет о готовности принимать запись.
+Signaling опрашивает authenticated `/health/ready` и выдаёт новые attempts только
+worker-у с доступной capacity.
+
+Composition worker предоставляет внутренние identity-free `/health/live` и
+`/health/ready`; контейнерный healthcheck использует readiness.
+
+## Сегменты и восстановление
+
+Capture worker хранит незавершённое состояние в отдельном private volume:
+
+```text
+/var/lib/conference-recording/
+└── capture-v2/
+    └── <recordingId>/
+        ├── state.json
+        ├── segments/
+        └── staging/
+```
+
+Durable spool:
+
+- ограничивает общий объём source media;
+- не допускает абсолютные пути, `..`, symlink escape и выход из recording
+  directory;
+- сохраняет checksum и timeline checkpoint до подтверждения сегмента;
+- после restart повторяет загрузку закрытых, но ещё не committed сегментов;
+- сверяет локальное состояние с paginated recovery projection API;
+- при конфликте или повреждении прекращает обработку fail-closed.
+
+Чистое завершение запечатывает запись как `complete`. После crash или
+неустранимого разрыва допустим только честный `partial` с зафиксированными gaps;
+угадывать потерянную timeline или публиковать непроверенный результат нельзя.
+
+## Docker deployment
+
+Проверка конфигурации:
+
+```bash
+docker compose --env-file .env.example config --quiet
+```
+
+Production pipeline экспортирует путь GitLab File Variable как
+`RECORDING_ENV_FILE`, обновляет пять capture worker-ов, затем composition worker
+и только после этого выполняет общий `up`.
+
+Ручной запуск с отдельным env-файлом:
+
+```bash
+export RECORDING_ENV_FILE=/secure/path/recording.prod.env
+docker compose \
+  --env-file "$RECORDING_ENV_FILE" \
+  -f docker-compose.yml \
+  up -d --build
+```
+
+Не помещайте `DATABASE_URL`, `RECORDING_S3_ACCESS_KEY_ID` или
+`RECORDING_S3_SECRET_ACCESS_KEY` в recorder env. Compose намеренно очищает эти
+значения в worker-контейнерах, а CI отклоняет production env с API-only
+credentials.
+
+## Локальная разработка
+
+Полный локальный runtime запускается только root Compose из корня Conference:
+
+```bash
+npm run dev
+```
+
+Он поднимает PostgreSQL, Redis, MinIO, API, signaling, Go capture и Node
+composition, применяет Prisma migrations и использует безопасные локальные
+credentials из корневого `.env.example`.
+
+Проверки Go capture:
+
+```bash
+cd recording-bot
 go test ./...
 go vet ./...
 ```
 
-For a verbose reproducible media-only run:
+Проверки composition:
 
-```powershell
-go test -run TestPionReceivesSupportedRTPAndVideoPLI -v
-go test -run TestPionAcceptsMediasoupICELiteOffer -v
+```bash
+cd recording-bot/composition
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run build
 ```
 
-The first command creates real Pion peers on localhost and transfers RTP/RTCP;
-the second applies captured-shape mediasoup transport/consumer fixtures,
-including VP8/H.264 RTX, header extensions and RTCP metadata.
+Сборка production-образа:
 
-## Test-only live probe
-
-The assignment gate is approved: a live probe will be the sole transient worker
-selected through the existing worker registry and fenced attempt `PUT`. It
-receives a dedicated one-use admission through that authoritative assignment;
-another worker must not receive or race the same attempt.
-
-T1A now implements that test-only control shim in `cmd/shim`. It exposes the
-existing `/health/live`, `/health/ready`, fenced attempt `PUT` and bounded
-idempotent `DELETE` worker boundary with capacity one. Signaling supplies the
-one-use admission only inside the authenticated attempt body; the shim passes it
-directly to the in-process Pion runner and never reads it from environment,
-persists it or includes it in readiness, evidence, logs or errors. Direct
-`cmd/probe` invocation is disabled so copying, intercepting or replaying an
-admission cannot become an operator alternative.
-
-The shim uses the same static worker configuration names as production capture:
-
-```powershell
-$env:RECORDING_BOT_WORKER_ID='pion-t1a'
-$env:RECORDING_BOT_CONTROL_JWT_HS256_SECRET='<shared-static-control-secret>'
-$env:RECORDING_BOT_BIND_HOST='0.0.0.0'
-$env:RECORDING_BOT_PORT='8090'
-$env:RECORDING_BOT_START_TIMEOUT_MS='10000'
-$env:RECORDING_BOT_STOP_TIMEOUT_MS='5000'
-$env:RECORDING_CAPTURE_EXPECTED_SOURCES='mic,camera,screen'
-go run ./cmd/shim
+```bash
+docker build --target production -t conference-recording-bot:local .
 ```
 
-This command is safe only as the sole worker selected by the approved registry
-and fenced assignment. The shim reports bounded source/codec evidence in its
-attempt snapshot after tracks arrive. No live Docker Compose execution has been
-performed yet, so T1A provides a tested assignment seam but not live acceptance
-evidence.
+Статическая проверка cutover из корня Conference:
 
-The live media router now advertises Opus, VP8 and H.264 constrained baseline.
-The future shim live gate still has to demonstrate actual VP8/H.264 media
-receipt; the receiver fails explicitly when the router or consumer does not
-negotiate the required codec.
-
-## E13-T2/T4 production capture
-
-`cmd/capture` is the production entrypoint. It validates the established
-configuration names, private API credentials and writable spool root, then
-serves the authenticated fenced production attempt/finalization boundary. It
-does not reuse the T1 shim's runner.
-
-Required production configuration:
-
-```text
-RECORDING_RUNTIME_ENV=production
-RECORDING_API_INTERNAL_URL
-RECORDING_CAPTURE_SERVICE_SECRET
-RECORDING_BOT_CONTROL_JWT_HS256_SECRET
-RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS
+```bash
+npm run check:recording-cutover
+docker compose --env-file .env.example config --quiet
+docker compose \
+  --env-file recording-bot/.env.example \
+  -f recording-bot/docker-compose.yml \
+  config --quiet
 ```
 
-`RECORDING_RUNTIME_ENV` is the worker security mode and is independent from
-Node's `NODE_ENV`. The root development Compose sets it to `development`, so
-the committed local `.env.example` values are accepted. The standalone
-recording deployment sets it explicitly to `production`; production secret
-validation is fail-closed, and an omitted mode also defaults to `production`.
+## Диагностика
 
-The first three names already existed in the Chromium deployment. The only new
-mandatory GitLab variable is `RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS` (recommended
-value `300`), and API must use the same value. Optional new overrides are
-`RECORDING_COMPOSITION_FFMPEG_TIMEOUT_MS=21600000`,
-`RECORDING_COMPOSITION_HTTP_TIMEOUT_MS=120000` and
-`RECORDING_BOT_LOG_LEVEL=info`; omitting them uses those defaults.
+Статус контейнеров:
 
-Established defaults remain unchanged: `RECORDING_BOT_BIND_HOST=0.0.0.0`,
-`RECORDING_BOT_PORT=8090`, `RECORDING_BOT_MAX_SLOTS=1`, start timeout 30 seconds,
-stop timeout 5 seconds, recovery timeout 30 seconds and
-`RECORDING_STORAGE_ROOT=/var/lib/conference-recording`. The shared direct-upload
-deadline is required as a base-10 value from 1 through 3600 seconds and has no
-service default. `RECORDING_BOT_LOG_LEVEL` is observability-only and
-defaults to `info`. `RECORDING_FFMPEG_PATH` defaults to `ffmpeg`;
-the composition-only FFmpeg timeout defaults to 6 hours and is capped at 24 hours,
-while its HTTP timeout defaults to 120 seconds and is capped at 10 minutes.
-`RECORDING_MAX_SOURCE_BYTES` and `RECORDING_MAX_DURATION_SECONDS` retain the established
-bounded defaults.
-
-The T4 pipeline:
-
-- consumes unchanged `recording-bot.v1` snapshots/events and keeps raw IDs only
-  in memory while persisting recording-scoped opaque identities;
-- writes independent per-track RTP intermediates in the bounded private spool,
-  supervises FFmpeg `-c copy` muxing into closed VP8/Opus WebM or H.264 Matroska
-  segments outside the RTP read loop through bounded per-track queues, fsyncs
-  and atomically promotes them;
-- checkpoints normalized timeline state before commit, transfers segment bytes
-  directly through the v2 presigned URL under the shared whole-PUT deadline,
-  and retries durable uncommitted segments after restart;
-- loads every bounded recovery page before mutation and seals clean attempts as
-  complete or terminal/finalization-only recovery as partial.
-
-Health remains fail-closed:
-
-- `GET /health/live` returns `200` while the process can serve HTTP;
-- `GET /health/ready` returns `200` only when the foundation is running and the
-  configured FFmpeg executable is resolvable; otherwise it returns `503`,
-  `capacity: 0` and `acceptingAttempts: false`. Readiness requires the existing
-  recording-control JWT because its payload includes worker/recovery identity;
-- the image health check calls only liveness and makes no media acceptance claim.
-
-The capture runtime is composed from `CaptureAttemptRunner`, the signaling
-`SignalingClient` and `PeerSession` boundaries, `RTPTrackWriter`,
-`DurableSpool`, the v2 control-plane client, `TimelineState` and
-`BoundedProcessSupervisor`. Small interfaces remain only at external or
-replaceable boundaries; concrete attempt, track and timeline components are not
-shadowed by unused one-method abstractions.
-
-Build and run the binary without changing root Compose:
-
-```powershell
-go build ./cmd/capture
-go run ./cmd/capture
+```bash
+docker compose --env-file "$RECORDING_ENV_FILE" ps
 ```
 
-The production `Dockerfile` builds the static Go binary plus compiled Node
-composition runtime on Node 22 Alpine 3.21. It installs the exact Alpine
-`ffmpeg=6.1.2-r1` package, which supplies both `/usr/bin/ffmpeg` and
-`/usr/bin/ffprobe`, and asserts both binaries during image build. The container
-health check invokes the Go binary's liveness-only `healthcheck` command; it
-does not claim readiness or live media acceptance. The entrypoint prepares only
-the assigned volume and drops capture to UID/GID 65532 or composition to the
-image's `node` user. `composition/Dockerfile` remains available for focused
-package builds.
+Логи конкретного worker-а:
 
-`docker-compose.yml` preserves the deployed topology of five independently
-addressable capture containers and one composition container with separate
-credentials, storage volumes and resource limits.
+```bash
+docker compose --env-file "$RECORDING_ENV_FILE" logs -f recording-capture-1
+```
 
-The composition worker exposes identity-free `/health/live` and
-`/health/ready` endpoints on its internal port. Its container health check uses
-readiness. A fresh workspace is used for every lease attempt, and retryable
-failures return the job to the API queue. Final artifact upload uses the same
-required `RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS` value as capture; no additional
-GitLab variable is introduced. Final object keys are attempt-scoped, so artifact
-integrity does not depend on bucket versioning. API and composition must receive
-the same existing `RECORDING_FINALIZE_MAX_ATTEMPTS` value. The optional
-`RECORDING_COMPOSITION_PIDS_LIMIT` override defaults to `128`.
+Логи composition:
+
+```bash
+docker compose --env-file "$RECORDING_ENV_FILE" logs -f recording-composition
+```
+
+Liveness worker-а через private-интерфейс recording host:
+
+```bash
+curl -fsS http://<private-recorder-ip>:8091/health/live
+```
+
+Типовые причины недоступной записи:
+
+- signaling не видит worker из-за неверного private IP, порта или security
+  group;
+- `RECORDING_BOT_CONTROL_JWT_HS256_SECRET` отличается у media и recorder;
+- API недоступен по `RECORDING_API_INTERNAL_URL`;
+- capture/composition service secret не совпадает с API;
+- отсутствует FFmpeg/FFprobe или spool volume недоступен для записи;
+- исчерпана capacity всех worker-ов;
+- presigned PUT истёк или превышен общий S3 PUT deadline;
+- S3/provider или private API временно недоступен.
+
+## Ограничения и обязательные проверки перед production
+
+- Реальная capacity определяется нагрузочным тестом host, а не только
+  `RECORDING_BOT_MAX_SLOTS`.
+- До production cutover требуется end-to-end smoke test с настоящим Yandex
+  Object Storage.
+- Нужно проверить live camera, mic, screen share, VP8 и H.264.
+- Нужно проверить restart capture, restart composition, временную недоступность
+  API/S3, stale lease, partial recording и отсутствие публикации повреждённого
+  MP4.
+- Bucket должен оставаться private; download выдаётся только через
+  integration-authorized API flow.
+
+## Git
+
+`.gitignore` исключает `.env`, временные сегменты, MP4/WebM/Matroska,
+`node_modules`, `dist`, spool data и локальные артефакты. В Git добавляются
+только исходники, Docker-конфигурация и `.env.example` с безопасными
+placeholder-значениями.
+
+Никогда не коммитьте production secrets, S3 credentials, private URLs,
+записанные медиафайлы или browser/network traces.
