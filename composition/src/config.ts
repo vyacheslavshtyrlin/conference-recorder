@@ -1,6 +1,10 @@
 import { z } from "zod";
 
+const insecureSecretMarkerPattern =
+  /(^|[^a-z0-9])(change[-_]me|example|local|replace[-_]with|placeholder)($|[^a-z0-9])/i;
+
 const schema = z.object({
+  RECORDING_RUNTIME_ENV: z.enum(["development", "production"]).default("production"),
   RECORDING_STORAGE_ROOT: z.string().min(1).default("/var/lib/conference-recording"),
   RECORDING_API_INTERNAL_URL: z.string().url(),
   RECORDING_COMPOSITION_SERVICE_SECRET: z.string().min(32),
@@ -13,6 +17,15 @@ const schema = z.object({
   RECORDING_FINALIZE_RETRY_DELAY_MS: z.coerce.number().int().min(0).max(30_000).default(250),
   RECORDING_MAX_SOURCE_BYTES: z.coerce.number().int().min(1_000_000).max(1_000_000_000_000).default(4_000_000_000),
   RECORDING_MAX_DURATION_SECONDS: z.coerce.number().int().min(1).max(86_400).default(14_400),
+}).superRefine((value, context) => {
+  if (value.RECORDING_RUNTIME_ENV === "production" &&
+    insecureSecretMarkerPattern.test(value.RECORDING_COMPOSITION_SERVICE_SECRET)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "must not use a placeholder value",
+      path: ["RECORDING_COMPOSITION_SERVICE_SECRET"],
+    });
+  }
 });
 
 export function readConfig(environment: NodeJS.ProcessEnv = process.env) {

@@ -154,10 +154,10 @@ async function apiRequest<T>(
   );
 }
 
-async function once(): Promise<void> {
+async function once(shutdownSignal?: AbortSignal): Promise<void> {
   const claim = await apiRequest<Claim>(
     "/internal/v1/composition-jobs/claim",
-    { body: {}, retry: false },
+    { body: {}, retry: false, ...(shutdownSignal ? { signal: shutdownSignal } : {}) },
   );
   if (!claim.job) return;
   workerState = "composing";
@@ -165,6 +165,13 @@ async function once(): Promise<void> {
   const jobRoot = join(root, jobId);
   const directory = join(jobRoot, randomUUID());
   const lease = new LeaseGuard(claim.job.leaseExpiresAt);
+  const abortForShutdown = () => lease.abort(retryableFailure(
+    "COMPOSITION_SHUTDOWN",
+    "lease",
+    "Composition worker is draining for shutdown",
+  ));
+  shutdownSignal?.addEventListener("abort", abortForShutdown, { once: true });
+  if (shutdownSignal?.aborted) abortForShutdown();
   const heartbeatWake = new AbortController();
   let heartbeatStopped = false;
   const heartbeat = async () => {
@@ -221,8 +228,8 @@ async function once(): Promise<void> {
     );
   } catch (error) {
     const report = failureReport(error);
-    const retryable = (report.retryable || lease.signal.aborted) &&
-      claim.job.attempts < config.finalizeMaxAttempts;
+    const retryable = report.code === "COMPOSITION_SHUTDOWN" ||
+      ((report.retryable || lease.signal.aborted) && claim.job.attempts < config.finalizeMaxAttempts);
     const endpoint = retryable ? "retry" : "fail";
     await apiRequest(
       `/internal/v1/composition-jobs/${jobId}/${endpoint}`,
@@ -237,6 +244,7 @@ async function once(): Promise<void> {
     ).catch(() => undefined);
     reportFailure("composition.job.failed", report);
   } finally {
+    shutdownSignal?.removeEventListener("abort", abortForShutdown);
     heartbeatStopped = true;
     heartbeatWake.abort();
     lease.abort();
@@ -706,16 +714,28 @@ function delayUntilAborted(milliseconds: number, signal: AbortSignal): Promise<v
 async function main(): Promise<void> {
   await rm(root, { recursive: true, force: true });
   await mkdir(root, { recursive: true, mode: 0o750 });
-  startHealthServer();
+  const healthServer = startHealthServer();
+  const shutdown = new AbortController();
+  let shutdownRequested = false;
+  const requestShutdown = () => {
+    shutdownRequested = true;
+    workerState = "starting";
+    shutdown.abort();
+  };
+  process.once("SIGINT", requestShutdown);
+  process.once("SIGTERM", requestShutdown);
   workerState = "idle";
-  for (;;) {
+  while (!shutdownRequested) {
     try {
-      await once();
+      await once(shutdown.signal);
     } catch (error) {
       reportFailure("composition.claim.failed", failureReport(error));
     }
-    await delay(2_000);
+    if (!shutdownRequested) await delay(2_000);
   }
+  await new Promise<void>((resolve, reject) => {
+    healthServer.close((error) => error ? reject(error) : resolve());
+  });
 }
 
 function reportFailure(
@@ -732,8 +752,8 @@ function reportFailure(
   }));
 }
 
-function startHealthServer(): void {
-  createServer((request, response) => {
+function startHealthServer(): ReturnType<typeof createServer> {
+  return createServer((request, response) => {
     if (request.url !== "/health/live" && request.url !== "/health/ready") {
       response.writeHead(404).end();
       return;
@@ -748,4 +768,7 @@ function startHealthServer(): void {
   }).listen(8090, "0.0.0.0");
 }
 
-void main();
+void main().catch((error) => {
+  reportFailure("composition.claim.failed", failureReport(error));
+  process.exitCode = 1;
+});

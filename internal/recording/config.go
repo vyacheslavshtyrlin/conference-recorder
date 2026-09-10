@@ -11,22 +11,30 @@ import (
 )
 
 const (
-	defaultCapturePort        = 8090
-	defaultMaxSlots           = 1
-	defaultStartTimeout       = 30 * time.Second
-	defaultStopTimeout        = 5 * time.Second
-	defaultRecoveryTimeout    = 30 * time.Second
-	defaultFFmpegTimeout      = 120 * time.Second
-	defaultMaxSourceBytes     = int64(4_000_000_000)
-	defaultMaxDuration        = 14_400 * time.Second
-	defaultStorageRoot        = "/var/lib/conference-recording"
-	defaultObservabilityLevel = "info"
+	developmentRuntimeEnvironment = "development"
+	productionRuntimeEnvironment  = "production"
+	defaultCapturePort            = 8090
+	defaultMaxSlots               = 1
+	defaultStartTimeout           = 30 * time.Second
+	defaultStopTimeout            = 5 * time.Second
+	defaultRecoveryTimeout        = 30 * time.Second
+	defaultFFmpegTimeout          = 120 * time.Second
+	defaultMaxSourceBytes         = int64(4_000_000_000)
+	defaultMaxDuration            = 14_400 * time.Second
+	defaultStorageRoot            = "/var/lib/conference-recording"
+	defaultObservabilityLevel     = "info"
 )
 
-var workerIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,128}$`)
+var (
+	workerIDPattern          = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,128}$`)
+	placeholderSecretPattern = regexp.MustCompile(
+		`(?i)(^|[^a-z0-9])(change[-_]me|example|local|replace[-_]with|placeholder)($|[^a-z0-9])`,
+	)
+)
 
 // Config contains capture worker runtime settings.
 type Config struct {
+	RuntimeEnvironment   string
 	BindHost             string
 	Port                 int
 	WorkerID             string
@@ -59,6 +67,11 @@ type lookupEnv func(string) (string, bool)
 
 func loadConfig(lookup lookupEnv, hostname string) (Config, error) {
 	config := Config{
+		RuntimeEnvironment: envOrDefault(
+			lookup,
+			"RECORDING_RUNTIME_ENV",
+			productionRuntimeEnvironment,
+		),
 		BindHost:             envOrDefault(lookup, "RECORDING_BOT_BIND_HOST", "0.0.0.0"),
 		WorkerID:             envOrDefault(lookup, "RECORDING_BOT_WORKER_ID", hostname),
 		StorageRoot:          envOrDefault(lookup, "RECORDING_STORAGE_ROOT", defaultStorageRoot),
@@ -162,6 +175,15 @@ func loadConfig(lookup lookupEnv, hostname string) (Config, error) {
 }
 
 func (config Config) validate() error {
+	runtimeEnvironment := config.RuntimeEnvironment
+	if runtimeEnvironment == "" {
+		runtimeEnvironment = productionRuntimeEnvironment
+	}
+	switch runtimeEnvironment {
+	case developmentRuntimeEnvironment, productionRuntimeEnvironment:
+	default:
+		return errors.New("RECORDING_RUNTIME_ENV must be development or production")
+	}
 	if strings.TrimSpace(config.BindHost) == "" {
 		return errors.New("RECORDING_BOT_BIND_HOST must not be empty")
 	}
@@ -201,8 +223,16 @@ func (config Config) validate() error {
 	if len(config.CaptureServiceSecret) < 32 {
 		return errors.New("RECORDING_CAPTURE_SERVICE_SECRET must contain at least 32 bytes")
 	}
+	if runtimeEnvironment == productionRuntimeEnvironment &&
+		isPlaceholderSecret(config.CaptureServiceSecret) {
+		return errors.New("RECORDING_CAPTURE_SERVICE_SECRET must not use a placeholder value")
+	}
 	if len(config.ControlJWTSecret) < 32 {
 		return errors.New("RECORDING_BOT_CONTROL_JWT_HS256_SECRET must contain at least 32 bytes")
+	}
+	if runtimeEnvironment == productionRuntimeEnvironment &&
+		isPlaceholderSecret(config.ControlJWTSecret) {
+		return errors.New("RECORDING_BOT_CONTROL_JWT_HS256_SECRET must not use a placeholder value")
 	}
 	switch config.LogLevel {
 	case "debug", "info", "warn", "error":
@@ -210,6 +240,10 @@ func (config Config) validate() error {
 	default:
 		return errors.New("RECORDING_BOT_LOG_LEVEL must be debug, info, warn or error")
 	}
+}
+
+func isPlaceholderSecret(secret string) bool {
+	return placeholderSecretPattern.MatchString(strings.TrimSpace(secret))
 }
 
 func requiredBoundedSeconds(

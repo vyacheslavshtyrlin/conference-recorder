@@ -19,6 +19,9 @@ func TestLoadConfigPreservesApplicableLegacyDefaults(t *testing.T) {
 	if config.Port != 8090 || config.MaxSlots != 1 {
 		t.Fatalf("unexpected capacity defaults: port=%d slots=%d", config.Port, config.MaxSlots)
 	}
+	if config.RuntimeEnvironment != productionRuntimeEnvironment {
+		t.Fatalf("unexpected runtime environment default %q", config.RuntimeEnvironment)
+	}
 	if config.WorkerID != "capture-host" {
 		t.Fatalf("unexpected worker ID %q", config.WorkerID)
 	}
@@ -63,6 +66,143 @@ func TestLoadConfigRejectsMissingProductionPrerequisites(t *testing.T) {
 	_, err := loadConfig(mapLookup(map[string]string{}), "capture-host")
 	if err == nil {
 		t.Fatal("missing private API configuration was accepted")
+	}
+}
+
+func TestLoadConfigRejectsPlaceholderServiceSecrets(t *testing.T) {
+	base := map[string]string{
+		"RECORDING_RUNTIME_ENV":                  "production",
+		"RECORDING_API_INTERNAL_URL":             "http://api:3000/internal/v1",
+		"RECORDING_CAPTURE_SERVICE_SECRET":       "capture-service-secret-at-least-32-bytes",
+		"RECORDING_BOT_CONTROL_JWT_HS256_SECRET": "control-service-secret-at-least-32-bytes",
+		"RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS": "300",
+	}
+	cases := []struct {
+		name        string
+		environment string
+		value       string
+		expectedErr string
+	}{
+		{
+			name:        "capture change-me",
+			environment: "RECORDING_CAPTURE_SERVICE_SECRET",
+			value:       "change-me-recording-capture-secret-32-bytes",
+			expectedErr: "RECORDING_CAPTURE_SERVICE_SECRET must not use a placeholder value",
+		},
+		{
+			name:        "capture example",
+			environment: "RECORDING_CAPTURE_SERVICE_SECRET",
+			value:       "example-recording-capture-secret-32-bytes",
+			expectedErr: "RECORDING_CAPTURE_SERVICE_SECRET must not use a placeholder value",
+		},
+		{
+			name:        "capture local",
+			environment: "RECORDING_CAPTURE_SERVICE_SECRET",
+			value:       "local-recording-capture-secret-32-bytes",
+			expectedErr: "RECORDING_CAPTURE_SERVICE_SECRET must not use a placeholder value",
+		},
+		{
+			name:        "capture replace-with",
+			environment: "RECORDING_CAPTURE_SERVICE_SECRET",
+			value:       "replace-with-at-least-32-random-characters",
+			expectedErr: "RECORDING_CAPTURE_SERVICE_SECRET must not use a placeholder value",
+		},
+		{
+			name:        "control uppercase replace-with",
+			environment: "RECORDING_BOT_CONTROL_JWT_HS256_SECRET",
+			value:       "REPLACE-WITH-at-least-32-random-characters",
+			expectedErr: "RECORDING_BOT_CONTROL_JWT_HS256_SECRET must not use a placeholder value",
+		},
+		{
+			name:        "control placeholder",
+			environment: "RECORDING_BOT_CONTROL_JWT_HS256_SECRET",
+			value:       "control-placeholder-secret-at-least-32-bytes",
+			expectedErr: "RECORDING_BOT_CONTROL_JWT_HS256_SECRET must not use a placeholder value",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			environment := make(map[string]string, len(base))
+			for key, item := range base {
+				environment[key] = item
+			}
+			environment[testCase.environment] = testCase.value
+
+			_, err := loadConfig(mapLookup(environment), "capture-host")
+			if err == nil || err.Error() != testCase.expectedErr {
+				t.Fatalf("unexpected placeholder validation error for %s: %v", testCase.environment, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigAllowsSecretThatMerelyContainsExample(t *testing.T) {
+	environment := map[string]string{
+		"RECORDING_API_INTERNAL_URL":             "http://api:3000/internal/v1",
+		"RECORDING_CAPTURE_SERVICE_SECRET":       "randomexamplevalue-with-at-least-32-bytes",
+		"RECORDING_BOT_CONTROL_JWT_HS256_SECRET": "anotherexamplevalue-with-at-least-32-bytes",
+		"RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS": "300",
+	}
+
+	if _, err := loadConfig(mapLookup(environment), "capture-host"); err != nil {
+		t.Fatalf("valid random secrets were rejected: %v", err)
+	}
+}
+
+func TestLoadConfigAllowsRootLocalChangeMeSecrets(t *testing.T) {
+	environment := map[string]string{
+		"RECORDING_RUNTIME_ENV":                  "development",
+		"RECORDING_API_INTERNAL_URL":             "http://api:3000/internal/v1",
+		"RECORDING_CAPTURE_SERVICE_SECRET":       "change-me-recording-capture-secret-32-bytes",
+		"RECORDING_BOT_CONTROL_JWT_HS256_SECRET": "change-me-recording-bot-control-secret-32-bytes",
+		"RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS": "300",
+	}
+
+	if _, err := loadConfig(mapLookup(environment), "capture-host"); err != nil {
+		t.Fatalf("root-local secrets were rejected: %v", err)
+	}
+}
+
+func TestLoadConfigDevelopmentStillValidatesSecretLength(t *testing.T) {
+	environment := map[string]string{
+		"RECORDING_RUNTIME_ENV":                  "development",
+		"RECORDING_API_INTERNAL_URL":             "http://api:3000/internal/v1",
+		"RECORDING_CAPTURE_SERVICE_SECRET":       "short",
+		"RECORDING_BOT_CONTROL_JWT_HS256_SECRET": "change-me-recording-bot-control-secret-32-bytes",
+		"RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS": "300",
+	}
+
+	if _, err := loadConfig(mapLookup(environment), "capture-host"); err == nil {
+		t.Fatal("short development secret was accepted")
+	}
+}
+
+func TestLoadConfigDefaultsToProductionSecurity(t *testing.T) {
+	environment := map[string]string{
+		"NODE_ENV":                               "development",
+		"RECORDING_API_INTERNAL_URL":             "http://api:3000/internal/v1",
+		"RECORDING_CAPTURE_SERVICE_SECRET":       "change-me-recording-capture-secret-32-bytes",
+		"RECORDING_BOT_CONTROL_JWT_HS256_SECRET": "control-service-secret-at-least-32-bytes",
+		"RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS": "300",
+	}
+
+	if _, err := loadConfig(mapLookup(environment), "capture-host"); err == nil {
+		t.Fatal("unset RECORDING_RUNTIME_ENV did not default to production security")
+	}
+}
+
+func TestLoadConfigRejectsInvalidRuntimeEnvironment(t *testing.T) {
+	environment := map[string]string{
+		"RECORDING_RUNTIME_ENV":                  "staging",
+		"RECORDING_API_INTERNAL_URL":             "http://api:3000/internal/v1",
+		"RECORDING_CAPTURE_SERVICE_SECRET":       "capture-service-secret-at-least-32-bytes",
+		"RECORDING_BOT_CONTROL_JWT_HS256_SECRET": "control-service-secret-at-least-32-bytes",
+		"RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS": "300",
+	}
+
+	_, err := loadConfig(mapLookup(environment), "capture-host")
+	if err == nil || err.Error() != "RECORDING_RUNTIME_ENV must be development or production" {
+		t.Fatalf("unexpected runtime environment validation error: %v", err)
 	}
 }
 

@@ -46,6 +46,7 @@ type controlAttempt struct {
 	startupDone            chan struct{}
 	startupResolved        bool
 	startupErr             error
+	captureStarted         bool
 	stopRequested          bool
 	stopFailed             bool
 }
@@ -253,6 +254,7 @@ func (manager *controlAttemptManager) run(
 			return
 		}
 		attempt.state = "capturing"
+		attempt.captureStarted = true
 		manager.resolveStartupLocked(attempt, nil)
 	}, func(evidence recording.ProbeEvidence) {
 		manager.mu.Lock()
@@ -283,7 +285,9 @@ func (manager *controlAttemptManager) run(
 		if !attempt.startupResolved {
 			manager.resolveStartupLocked(attempt, errStartupFailed)
 		}
-		if !unexpectedExit {
+		retainFailure := unexpectedExit &&
+			(attempt.captureStarted || attempt.captureProtocolVersion == recording.CaptureProtocolVersion)
+		if !retainFailure {
 			delete(manager.attempts, attempt.identity.recordingID)
 		} else {
 			slog.Error(

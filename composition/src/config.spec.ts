@@ -38,4 +38,55 @@ describe("composition config", () => {
     expect(() => readConfig({})).toThrow();
     expect(() => readConfig({ ...valid, RECORDING_COMPOSITION_SERVICE_SECRET: "short" })).toThrow();
   });
+
+  it.each([
+    "change-me-recording-composition-secret-32-bytes",
+    "example-recording-composition-secret-32-bytes",
+    "local-recording-composition-secret-32-bytes",
+    "replace-with-at-least-32-random-characters",
+    "composition-placeholder-secret-at-least-32-bytes",
+  ])("rejects placeholder composition secret %s", (secret) => {
+    expect(() => readConfig({
+      ...valid,
+      RECORDING_COMPOSITION_SERVICE_SECRET: secret,
+    })).toThrow("must not use a placeholder value");
+  });
+
+  it("allows a random secret that merely contains example", () => {
+    expect(readConfig({
+      ...valid,
+      RECORDING_COMPOSITION_SERVICE_SECRET: "randomexamplevalue-with-at-least-32-bytes",
+    }).compositionServiceSecret).toBe("randomexamplevalue-with-at-least-32-bytes");
+  });
+
+  it("allows the root-local change-me secret in development", () => {
+    expect(readConfig({
+      ...valid,
+      RECORDING_RUNTIME_ENV: "development",
+      RECORDING_COMPOSITION_SERVICE_SECRET: "change-me-recording-composition-secret-32-bytes",
+    }).compositionServiceSecret).toBe("change-me-recording-composition-secret-32-bytes");
+  });
+
+  it("keeps structural secret validation enabled in development", () => {
+    expect(() => readConfig({
+      ...valid,
+      RECORDING_RUNTIME_ENV: "development",
+      RECORDING_COMPOSITION_SERVICE_SECRET: "short",
+    })).toThrow();
+  });
+
+  it("defaults to production security independently of NODE_ENV", () => {
+    expect(() => readConfig({
+      ...valid,
+      NODE_ENV: "development",
+      RECORDING_COMPOSITION_SERVICE_SECRET: "change-me-recording-composition-secret-32-bytes",
+    })).toThrow("must not use a placeholder value");
+  });
+
+  it("rejects an invalid recording runtime environment", () => {
+    expect(() => readConfig({
+      ...valid,
+      RECORDING_RUNTIME_ENV: "staging",
+    })).toThrow();
+  });
 });

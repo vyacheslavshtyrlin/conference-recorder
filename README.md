@@ -93,11 +93,18 @@ does not reuse the T1 shim's runner.
 Required production configuration:
 
 ```text
+RECORDING_RUNTIME_ENV=production
 RECORDING_API_INTERNAL_URL
 RECORDING_CAPTURE_SERVICE_SECRET
 RECORDING_BOT_CONTROL_JWT_HS256_SECRET
 RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS
 ```
+
+`RECORDING_RUNTIME_ENV` is the worker security mode and is independent from
+Node's `NODE_ENV`. The root development Compose sets it to `development`, so
+the committed local `.env.example` values are accepted. The standalone
+recording deployment sets it explicitly to `production`; production secret
+validation is fail-closed, and an omitted mode also defaults to `production`.
 
 The first three names already existed in the Chromium deployment. The only new
 mandatory GitLab variable is `RECORDING_S3_MAX_IN_FLIGHT_PUT_SECONDS` (recommended

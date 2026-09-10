@@ -1,5 +1,10 @@
 ﻿name: conference-recording
 
+x-worker-secret-boundary: &worker-secret-boundary
+  DATABASE_URL:
+  RECORDING_S3_ACCESS_KEY_ID:
+  RECORDING_S3_SECRET_ACCESS_KEY:
+
 services:
   recording-capture-1:
     init: true
@@ -8,8 +13,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
       RECORDING_BOT_WORKER_ID: recording-worker-1
@@ -24,6 +31,7 @@ services:
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-2:
     init: true
@@ -32,8 +40,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
       RECORDING_BOT_WORKER_ID: recording-worker-2
@@ -48,6 +58,7 @@ services:
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-3:
     init: true
@@ -56,8 +67,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
       RECORDING_BOT_WORKER_ID: recording-worker-3
@@ -72,6 +85,7 @@ services:
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-4:
     init: true
@@ -80,8 +94,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
       RECORDING_BOT_WORKER_ID: recording-worker-4
@@ -96,6 +112,7 @@ services:
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-5:
     init: true
@@ -104,8 +121,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
       RECORDING_BOT_WORKER_ID: recording-worker-5
@@ -120,6 +139,7 @@ services:
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-composition:
     init: true
@@ -129,9 +149,11 @@ services:
       dockerfile: Dockerfile
     command: ["node", "dist/composition.js"]
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
       NODE_ENV: production
+      RECORDING_RUNTIME_ENV: production
       RECORDING_CAPTURE_SERVICE_SECRET: ""
       RECORDING_BOT_CONTROL_JWT_HS256_SECRET: ""
     healthcheck:
@@ -147,6 +169,7 @@ services:
     mem_limit: "${RECORDING_COMPOSITION_MEMORY_LIMIT:-4g}"
     pids_limit: "${RECORDING_COMPOSITION_PIDS_LIMIT:-128}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_COMPOSITION_STOP_GRACE_PERIOD:-5m20s}
 
 volumes:
   recording-capture-1-data:

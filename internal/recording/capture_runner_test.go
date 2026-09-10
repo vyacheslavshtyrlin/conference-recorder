@@ -128,14 +128,20 @@ func (fixture *controlPlaneFixture) PutCheckpoint(_ context.Context, fence Captu
 
 func TestSameMillisecondLifecycleCheckpointsDeferUntilRepresentableBoundary(t *testing.T) {
 	root := t.TempDir()
-	spool, _ := NewDurableSpool(root, 1_000_000)
-	_, _ = spool.Begin(
+	spool, err := NewDurableSpool(root, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = spool.Begin(
 		context.Background(),
 		AttemptFence{"attempt-1", "rec-1", "worker-1", "process-1"},
 		1,
 		"2026-08-25T10:00:00Z",
 		"capture",
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	api := &controlPlaneFixture{}
 	session := fixtureCaptureSession(
 		api,
@@ -177,14 +183,20 @@ func TestSameMillisecondLifecycleCheckpointsDeferUntilRepresentableBoundary(t *t
 
 func TestCheckpointRejectsTimelinePastConfiguredMaximum(t *testing.T) {
 	root := t.TempDir()
-	spool, _ := NewDurableSpool(root, 1_000_000)
-	_, _ = spool.Begin(
+	spool, err := NewDurableSpool(root, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = spool.Begin(
 		context.Background(),
 		AttemptFence{"attempt-1", "rec-1", "worker-1", "process-1"},
 		1,
 		"2026-08-25T10:00:00Z",
 		"capture",
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	session := fixtureCaptureSession(
 		&controlPlaneFixture{},
 		spool,

@@ -659,6 +659,9 @@ func TestHigherGenerationFencesStaleSpoolMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldFence := testMutationFence()
+	if err := os.MkdirAll(filepath.Join(root, "capture-v2", "rec-1", "staging"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	staging := filepath.Join(root, "capture-v2", "rec-1", "staging", "old.part")
 	if err := spool.ResizeStaging(oldFence, staging, 10); err != nil {
 		t.Fatal(err)

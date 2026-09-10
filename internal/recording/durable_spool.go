@@ -61,10 +61,10 @@ func NewDurableSpool(root string, maxBytes int64) (*DurableSpool, error) {
 	}
 	root = filepath.Clean(root)
 	if err := ensureRealDirectory(root, 0o700); err != nil {
-		return nil, errors.New("prepare real durable spool root")
+		return nil, fmt.Errorf("prepare real durable spool root: %w", err)
 	}
 	if err := ensureRealDirectory(filepath.Join(root, "capture-v2"), 0o700); err != nil {
-		return nil, errors.New("prepare real capture spool root")
+		return nil, fmt.Errorf("prepare real capture spool root: %w", err)
 	}
 	return &DurableSpool{
 		root:      root,

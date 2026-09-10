@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { resolve } from "node:path";
 import process from "node:process";
 
 const args = process.argv.slice(2);
@@ -7,7 +9,18 @@ if (args.length === 0) {
   process.exit(2);
 }
 
-const local = spawnSync("go", args, { stdio: "inherit" });
+const goEnvironment = { ...process.env };
+if (process.platform === "win32") {
+  const cacheDirectory = resolve(".gocache");
+  const temporaryDirectory = resolve("tmp");
+  mkdirSync(cacheDirectory, { recursive: true });
+  mkdirSync(temporaryDirectory, { recursive: true });
+  goEnvironment.GOCACHE = cacheDirectory;
+  goEnvironment.TEMP = temporaryDirectory;
+  goEnvironment.TMP = temporaryDirectory;
+}
+
+const local = spawnSync("go", args, { stdio: "inherit", env: goEnvironment });
 if (!local.error) process.exit(local.status ?? 1);
 if (local.error.code !== "ENOENT") throw local.error;
 
