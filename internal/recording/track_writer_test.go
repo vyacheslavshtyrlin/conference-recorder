@@ -123,6 +123,70 @@ func TestRTPTrackWriterNormalizesSignalingMIMECodec(t *testing.T) {
 	}
 }
 
+func TestRTPTrackWriterRequestsKeyFrameBeforeMaximumSegmentDuration(t *testing.T) {
+	participantID := ParticipantInstanceID("rec-1", "participant-1")
+	trackID, err := TrackID("rec-1", participantID, SourceCamera)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &trackFixture{
+		release: make(chan struct{}),
+		packets: []*rtp.Packet{
+			vp8Packet(1, true),
+			vp8Packet(2, false),
+			vp8Packet(3, true),
+		},
+	}
+	clockValues := []int64{0, 1100, 1200}
+	clock := func() int64 {
+		value := clockValues[0]
+		if len(clockValues) > 1 {
+			clockValues = clockValues[1:]
+		}
+		return value
+	}
+	keyFrameRequested := make(chan struct{}, 1)
+	segments := make(chan SegmentDescriptor, 2)
+	writer, err := StartRTPTrackWriter(context.Background(), RTPTrackWriterConfig{
+		Track: fixture, ParticipantInstanceID: participantID, TrackID: trackID,
+		Source: SourceCamera, Codec: "video/VP8", SpoolDirectory: t.TempDir(),
+		SegmentDuration: time.Second, MaximumSegmentDuration: 3 * time.Second,
+		TimelineClock: clock, Muxer: copyMuxer{}, OperationTimeout: time.Second,
+		RequestKeyFrame: func(context.Context) error {
+			keyFrameRequested <- struct{}{}
+			return nil
+		},
+		OnSegment: func(_ context.Context, segment SegmentDescriptor, _ string) error {
+			segments <- segment
+			return nil
+		},
+		newPacketWriter: func(_, path string, _ *rtp.Packet) (packetWriter, error) {
+			return packetCaptureWriter{path: path, payloads: &[][]byte{}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-keyFrameRequested:
+	case <-time.After(time.Second):
+		t.Fatal("video writer did not request a key frame at the segment boundary")
+	}
+	select {
+	case segment := <-segments:
+		if segment.StartMS != 0 || segment.EndMS != 1200 {
+			t.Fatalf("unexpected rotated segment: %+v", segment)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("key frame did not rotate the video segment")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := writer.CloseAt(ctx, 1300); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRTPTrackWriterTreatsRemoteEOFAsCleanTrackEnd(t *testing.T) {
 	participantID := ParticipantInstanceID("rec-1", "participant-1")
 	trackID, err := TrackID("rec-1", participantID, SourceCamera)

@@ -38,6 +38,9 @@ type SegmentReady func(context.Context, SegmentDescriptor, string) error
 
 type InitialTrackGap func(startMS, endMS int64) error
 
+// KeyFrameRequester asks the upstream video sender for a fresh key frame.
+type KeyFrameRequester func(context.Context) error
+
 type StagingBudget interface {
 	ResizeStaging(recordingID, path string, size int64) error
 	ReleaseStaging(recordingID, path string)
@@ -56,6 +59,7 @@ type RTPTrackWriter struct {
 	muxer               SegmentMuxer
 	ready               SegmentReady
 	initialGap          InitialTrackGap
+	requestKeyFrame     KeyFrameRequester
 	coverageStartMS     int64
 	newPacketWriter     packetWriterFactory
 	initialSequence     int32
@@ -72,6 +76,7 @@ type RTPTrackWriter struct {
 	mu                  sync.Mutex
 	result              error
 	closeAtMS           *int64
+	coverageThroughMS   int64
 }
 
 type closedTrackSegment struct {
@@ -96,6 +101,7 @@ type RTPTrackWriterConfig struct {
 	Muxer                  SegmentMuxer
 	OnSegment              SegmentReady
 	OnInitialGap           InitialTrackGap
+	RequestKeyFrame        KeyFrameRequester
 	CoverageStartMS        int64
 	InitialSequence        int32
 	OperationTimeout       time.Duration
@@ -147,7 +153,8 @@ func StartRTPTrackWriter(ctx context.Context, config RTPTrackWriterConfig) (*RTP
 		source: config.Source, codec: codec, spoolDirectory: filepath.Clean(config.SpoolDirectory),
 		segmentDuration: config.SegmentDuration, maximumDuration: config.MaximumSegmentDuration,
 		clock: config.TimelineClock, muxer: config.Muxer, ready: config.OnSegment,
-		initialGap: config.OnInitialGap, coverageStartMS: config.CoverageStartMS,
+		initialGap: config.OnInitialGap, requestKeyFrame: config.RequestKeyFrame,
+		coverageStartMS: config.CoverageStartMS, coverageThroughMS: config.CoverageStartMS,
 		newPacketWriter: packetFactory, initialSequence: config.InitialSequence,
 		operationTimeout:    config.OperationTimeout,
 		maximumStorageBytes: config.MaximumStorageBytes,
@@ -235,6 +242,20 @@ func (writer *RTPTrackWriter) run(ctx context.Context) {
 	}
 }
 
+func (writer *RTPTrackWriter) coverageEnd() int64 {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.coverageThroughMS
+}
+
+func (writer *RTPTrackWriter) advanceCoverage(throughMS int64) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if throughMS > writer.coverageThroughMS {
+		writer.coverageThroughMS = throughMS
+	}
+}
+
 func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 	var current packetWriter
 	var intermediate string
@@ -257,7 +278,9 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 				result = err
 				close(processingFailed)
 				_ = writer.track.SetReadDeadline(time.Now())
+				continue
 			}
+			writer.advanceCoverage(segment.endMS)
 		}
 		processingDone <- result
 	}()
@@ -284,12 +307,19 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 		if atMS < writer.coverageStartMS {
 			return errors.New("RTP coverage precedes active track interval")
 		}
-		coverageStarted = true
 		if writer.initialGap == nil {
+			coverageStarted = true
+			writer.advanceCoverage(atMS)
 			return nil
 		}
-		return writer.initialGap(writer.coverageStartMS, atMS)
+		if err := writer.initialGap(writer.coverageStartMS, atMS); err != nil {
+			return err
+		}
+		coverageStarted = true
+		writer.advanceCoverage(atMS)
+		return nil
 	}
+	lastKeyFrameRequestMS := int64(-1)
 	openSegment := func(packet *rtp.Packet, now int64) error {
 		segmentStart = now
 		filename := writer.trackID + "-" + sequenceString(sequence) + "-w" + writer.stagingID +
@@ -404,7 +434,8 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 				}
 				return closeSegment(boundary)
 			}
-			return errors.Join(fmt.Errorf("read remote RTP track: %w", err), startCoverage(writer.clock()))
+			failureMS := writer.clock()
+			return errors.Join(fmt.Errorf("read remote RTP track: %w", err), startCoverage(failureMS))
 		}
 		if ctx.Err() != nil {
 			boundary := writer.closingBoundary()
@@ -428,15 +459,28 @@ func (writer *RTPTrackWriter) capture(ctx context.Context) (result error) {
 			}
 		}
 		elapsed := time.Duration(now-segmentStart) * time.Millisecond
-		if havePackets && elapsed >= writer.segmentDuration && (writer.source == signaling.SourceMic || canStartSegment) {
-			if err := closeSegment(now); err != nil {
-				return err
+		if havePackets && elapsed >= writer.segmentDuration {
+			if writer.source == signaling.SourceMic || canStartSegment {
+				if err := closeSegment(now); err != nil {
+					return err
+				}
+				if err := openSegment(packet, now); err != nil {
+					return err
+				}
+				lastKeyFrameRequestMS = -1
+			} else {
+				requestInterval := min(writer.segmentDuration, 2*time.Second).Milliseconds()
+				shouldRequest := lastKeyFrameRequestMS < 0 || now-lastKeyFrameRequestMS >= requestInterval
+				if writer.requestKeyFrame != nil && shouldRequest {
+					lastKeyFrameRequestMS = now
+					requestContext, cancel := context.WithTimeout(ctx, min(writer.operationTimeout, time.Second))
+					_ = writer.requestKeyFrame(requestContext)
+					cancel()
+				}
+				if elapsed > writer.maximumDuration {
+					return errors.New("video keyframe segment bound exceeded")
+				}
 			}
-			if err := openSegment(packet, now); err != nil {
-				return err
-			}
-		} else if elapsed > writer.maximumDuration {
-			return errors.New("video keyframe segment bound exceeded")
 		}
 		if err := writer.reservePacketWrite(intermediate, &intermediateReserved, packet); err != nil {
 			return err

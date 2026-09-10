@@ -69,6 +69,7 @@ type TrackEvent struct {
 	Source      Source
 	Kind        MediaKind
 	Codec       string
+	MediaSSRC   uint32
 	Track       *webrtc.TrackRemote
 	SourceTrack RTPTrackSource
 }
@@ -291,6 +292,7 @@ func (session *PionSession) deliverTrack(
 			Source:      consumer.Source,
 			Kind:        consumer.Kind,
 			Codec:       track.Codec().MimeType,
+			MediaSSRC:   encoding.SSRC,
 			Track:       track,
 			SourceTrack: PionTrackSource{Track: track},
 		}

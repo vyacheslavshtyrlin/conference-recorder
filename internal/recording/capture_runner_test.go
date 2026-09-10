@@ -1619,6 +1619,120 @@ func TestProducerUpdatedDropsTrackInputWhenLogicalIdentityChanges(t *testing.T) 
 	}
 }
 
+func TestAcceptWriterFailureDeclaresGapThroughCheckpointBoundary(t *testing.T) {
+	const recordingID = "rec-1"
+	root := t.TempDir()
+	spool, err := NewDurableSpool(root, 1_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptFence := AttemptFence{
+		AttemptID: "attempt-1", RecordingID: recordingID,
+		WorkerID: "worker-1", WorkerGenerationID: "process-1",
+	}
+	if _, err := spool.Begin(
+		context.Background(),
+		attemptFence,
+		1,
+		"2026-08-25T10:00:00Z",
+		"capture",
+	); err != nil {
+		t.Fatal(err)
+	}
+	timeline, err := NewTimelineState(recordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := Producer{
+		ProducerID: "producer-1", ParticipantID: "participant-1", DisplayName: "Alex",
+		Kind: KindVideo, Source: SourceCamera,
+	}
+	if err := timeline.ApplySnapshot(Snapshot{
+		ProtocolVersion: ProtocolVersion,
+		RecordingID:     recordingID,
+		Revision:        1,
+		Participants:    []Participant{{ParticipantID: producer.ParticipantID, DisplayName: producer.DisplayName}},
+		Producers:       []Producer{producer},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	trackID, _, exists := timeline.TrackForProducer(producer.ProducerID)
+	if !exists {
+		t.Fatal("timeline track was not created")
+	}
+	media := []byte("durable segment pending after callback failure")
+	digest := sha256.Sum256(media)
+	descriptor := fixtureSegmentDescriptor(int64(len(media)), hex.EncodeToString(digest[:]))
+	descriptor.StartMS = 17_138
+	descriptor.EndMS = 20_000
+	stagingPath := writeTestStaging(t, root, "pending-writer-failure.part", media)
+	if _, err := spool.StoreSegment(
+		context.Background(),
+		testMutationFence(),
+		descriptor,
+		stagingPath,
+	); err != nil {
+		t.Fatal(err)
+	}
+	writer := &RTPTrackWriter{coverageThroughMS: 17_138}
+	fence := CaptureFence{recordingID, "worker-1", "process-1", 1}
+	session := fixtureCaptureSession(&controlPlaneFixture{}, spool, timeline, fence, root, 0)
+	session.checkpointBoundary = 47_252
+	session.writers[trackID] = writer
+	accepted, err := session.acceptWriterFailure(trackWriterFailure{
+		trackID: trackID,
+		writer:  writer,
+		err:     errors.New("video keyframe segment bound exceeded"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted {
+		t.Fatal("current writer failure was ignored")
+	}
+	session.mu.Lock()
+	session.checkpointBoundary = 50_000
+	session.mu.Unlock()
+	checkpointBoundary, err := session.checkpointBoundaryWithFailedWriterGaps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkpointBoundary != 50_000 {
+		t.Fatalf("unexpected synchronized checkpoint boundary: %d", checkpointBoundary)
+	}
+	if err := timeline.DeclareRecoveryGaps(checkpointBoundary, 57_453); err != nil {
+		t.Fatal(err)
+	}
+	records, err := timeline.RecordsThrough(57_453, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolAwareGapFound := false
+	extendedGapFound := false
+	terminalGapFound := false
+	for _, record := range records {
+		if record.Category == "gaps" && record.TrackID == trackID &&
+			record.StartMS != nil && *record.StartMS == 20_000 &&
+			record.EndMS != nil && *record.EndMS == 47_252 {
+			spoolAwareGapFound = true
+		}
+		if record.Category == "gaps" && record.TrackID == trackID &&
+			record.StartMS != nil && *record.StartMS == 47_252 &&
+			record.EndMS != nil && *record.EndMS == 50_000 {
+			extendedGapFound = true
+		}
+		if record.Category == "gaps" && record.TrackID == trackID &&
+			record.StartMS != nil && *record.StartMS == 50_000 &&
+			record.EndMS != nil && *record.EndMS == 57_453 &&
+			record.Reason == "capture_restart" {
+			terminalGapFound = true
+		}
+	}
+	if !spoolAwareGapFound || !extendedGapFound || !terminalGapFound {
+		t.Fatal("writer failure and terminal gaps did not form adjacent coverage")
+	}
+}
+
 func mustTimeline(t *testing.T) *TimelineState {
 	t.Helper()
 	timeline, err := NewTimelineState("rec-1")

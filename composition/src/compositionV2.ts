@@ -431,10 +431,18 @@ export function verifySourceProbe(raw: string, segment: ManifestSegment, toleran
   const durationTolerance = hasContainerDuration
     ? toleranceSeconds
     : Math.max(toleranceSeconds, expectedDuration * 0.15);
+  // Video RTP timestamps describe frames, not wall-clock source availability.
+  // A screen share (or a camera that is about to stop) can legitimately emit
+  // only a few frames and rely on the compositor's tpad clone for the rest of
+  // the active interval. Audio is continuous, so a short audio source still
+  // indicates missing capture data and must fail validation.
+  const isMateriallyShort = expectedKind === "audio"
+    && duration < expectedDuration - durationTolerance;
   const invalidProbe = !stream
     || stream.codec_name !== segment.codec
     || !Number.isFinite(duration)
-    || duration < expectedDuration - durationTolerance
+    || duration <= 0
+    || isMateriallyShort
     || duration > expectedDuration + durationTolerance;
   if (invalidProbe) {
     throw new Error("v2 source probe verification failed");

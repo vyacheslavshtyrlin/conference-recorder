@@ -303,7 +303,7 @@ func TestPionSessionDeliversCorrelatedTrackAndPLI(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for correlated Pion track")
 	}
-	if observed.ProducerID != "camera-1" || observed.Source != SourceCamera {
+	if observed.ProducerID != "camera-1" || observed.Source != SourceCamera || observed.MediaSSRC != ssrc {
 		t.Fatalf("unexpected track correlation: %+v", observed)
 	}
 

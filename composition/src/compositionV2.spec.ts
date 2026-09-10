@@ -430,13 +430,25 @@ describe("capture-v2 manifest and source bounds", () => {
   });
 
   it("rejects probe media that is materially shorter than its descriptor", () => {
-    const descriptor = segment("upload", "trk", "pi", "camera", 0, 10_000);
+    const descriptor = segment("upload", "trk", "pi", "mic", 0, 10_000);
     const probe = (duration: number) => JSON.stringify({
-      streams: [{ codec_type: "video", codec_name: "vp8" }],
+      streams: [{ codec_type: "audio", codec_name: "opus" }],
       format: { duration: String(duration) },
     });
     expect(() => verifySourceProbe(probe(10), descriptor)).not.toThrow();
     expect(() => verifySourceProbe(probe(1), descriptor)).toThrow("probe verification");
+  });
+  it("accepts sparse terminal video that the compositor can freeze-pad", () => {
+    const descriptor = segment("upload", "trk", "pi", "screen", 0, 1_950);
+    const probe = JSON.stringify({
+      streams: [{ codec_type: "video", codec_name: "vp8" }],
+      format: {},
+      packets: [
+        { pts_time: "0.000000", duration_time: "0.033000" },
+        { pts_time: "1.100000", duration_time: "0.033000" },
+      ],
+    });
+    expect(() => verifySourceProbe(probe, descriptor)).not.toThrow();
   });
   it("derives duration from packet timestamps for non-seekable short WebM segments", () => {
     const descriptor = segment("upload", "trk", "pi", "mic", 0, 114);

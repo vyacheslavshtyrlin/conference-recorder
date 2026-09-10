@@ -220,6 +220,7 @@ func (runner *CaptureAttemptRunner) Run(
 		_ = signalingClient.Close()
 		return err
 	}
+	session.peer = peer
 	controller, err := signaling.StartProbeWithObserver(ctx, signalingClient, peer, session)
 	if err != nil {
 		return err
@@ -305,9 +306,10 @@ func (runner *CaptureAttemptRunner) Run(
 			resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
 			return failAndSeal(errors.Join(peerErr, resumeErr))
 		case failure := <-session.writerErrors:
-			if session.acceptWriterFailure(failure) {
+			accepted, gapErr := session.acceptWriterFailure(failure)
+			if accepted {
 				resumeErr := stopPendingResume(cancelResume, resume, runner.dependencies.FinalizeTimeout)
-				return failAndSeal(errors.Join(failure.err, resumeErr))
+				return failAndSeal(errors.Join(failure.err, gapErr, resumeErr))
 			}
 		case lifecycleErr := <-lifecycle:
 			if errors.Is(lifecycleErr, signaling.ErrAuthoritativeStop) {
@@ -565,25 +567,27 @@ func (runner *CaptureAttemptRunner) Finalize(ctx context.Context, request Finali
 }
 
 type captureSession struct {
-	runner             *CaptureAttemptRunner
-	fence              CaptureFence
-	spoolFence         SpoolMutationFence
-	timeline           *TimelineState
-	startedAt          time.Time
-	mu                 sync.Mutex
-	observerMu         sync.Mutex
-	writerMu           sync.Mutex
-	checkpointMu       sync.Mutex
-	checkpointSequence int32
-	checkpointBoundary int64
-	coverageFloorMS    int64
-	writers            map[string]*RTPTrackWriter
-	startingWriters    map[string]struct{}
-	writerHandoffs     map[string]int64
-	trackInputs        map[string]signaling.TrackEvent
-	sequences          map[string]int32
-	writerErrors       chan trackWriterFailure
-	stopping           bool
+	runner               *CaptureAttemptRunner
+	fence                CaptureFence
+	spoolFence           SpoolMutationFence
+	timeline             *TimelineState
+	startedAt            time.Time
+	mu                   sync.Mutex
+	observerMu           sync.Mutex
+	writerMu             sync.Mutex
+	checkpointMu         sync.Mutex
+	checkpointSequence   int32
+	checkpointBoundary   int64
+	coverageFloorMS      int64
+	writers              map[string]*RTPTrackWriter
+	peer                 CapturePeer
+	startingWriters      map[string]struct{}
+	writerHandoffs       map[string]int64
+	failedWriterCoverage map[string]int64
+	trackInputs          map[string]signaling.TrackEvent
+	sequences            map[string]int32
+	writerErrors         chan trackWriterFailure
+	stopping             bool
 }
 
 type trackWriterFailure struct {
@@ -802,6 +806,7 @@ func (session *captureSession) startTrackInput(ctx context.Context, event signal
 		OnInitialGap: func(startMS, endMS int64) error {
 			return session.timeline.ResolveTrackCoverage(trackID, startMS, endMS)
 		},
+		RequestKeyFrame:     session.keyFrameRequester(event),
 		InitialSequence:     initialSequence,
 		OperationTimeout:    session.runner.dependencies.SegmentOperationTimeout,
 		MaximumStorageBytes: session.runner.dependencies.MaximumStorageBytes,
@@ -827,6 +832,16 @@ func (session *captureSession) startTrackInput(ctx context.Context, event signal
 	return nil
 }
 
+func (session *captureSession) keyFrameRequester(event signaling.TrackEvent) KeyFrameRequester {
+	if session.peer == nil || event.Kind != signaling.KindVideo || event.MediaSSRC == 0 {
+		return nil
+	}
+	ssrc := event.MediaSSRC
+	return func(ctx context.Context) error {
+		return session.peer.RequestKeyFrame(ctx, ssrc)
+	}
+}
+
 func (session *captureSession) observeWriter(ctx context.Context, trackID string, writer *RTPTrackWriter) {
 	select {
 	case err, open := <-writer.Errors():
@@ -841,14 +856,80 @@ func (session *captureSession) observeWriter(ctx context.Context, trackID string
 	}
 }
 
-func (session *captureSession) acceptWriterFailure(failure trackWriterFailure) bool {
+func (session *captureSession) acceptWriterFailure(failure trackWriterFailure) (bool, error) {
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	if session.writers[failure.trackID] != failure.writer {
-		return false
+		session.mu.Unlock()
+		return false, nil
 	}
 	delete(session.writers, failure.trackID)
-	return true
+	session.mu.Unlock()
+
+	coverageEnd, err := session.failedWriterCoverageEnd(failure)
+	if err != nil {
+		return true, err
+	}
+	session.checkpointMu.Lock()
+	defer session.checkpointMu.Unlock()
+	session.mu.Lock()
+	if session.failedWriterCoverage == nil {
+		session.failedWriterCoverage = map[string]int64{}
+	}
+	session.failedWriterCoverage[failure.trackID] = coverageEnd
+	checkpointBoundary := session.checkpointBoundary
+	session.mu.Unlock()
+	return true, session.declareFailedWriterGapsLocked(checkpointBoundary)
+}
+
+func (session *captureSession) failedWriterCoverageEnd(failure trackWriterFailure) (int64, error) {
+	coverageEnd := failure.writer.coverageEnd()
+	if session.runner == nil || session.runner.dependencies.Spool == nil {
+		return coverageEnd, nil
+	}
+	manifest, err := session.runner.dependencies.Spool.Snapshot(session.fence.RecordingID)
+	if err != nil {
+		return 0, err
+	}
+	for _, segment := range manifest.Segments {
+		isCurrentTrack := segment.TrackID == failure.trackID &&
+			segment.CaptureGeneration == session.fence.CaptureGeneration
+		if isCurrentTrack && segment.EndMS > coverageEnd {
+			coverageEnd = segment.EndMS
+		}
+	}
+	return coverageEnd, nil
+}
+
+func (session *captureSession) checkpointBoundaryWithFailedWriterGaps() (int64, error) {
+	session.checkpointMu.Lock()
+	defer session.checkpointMu.Unlock()
+	session.mu.Lock()
+	checkpointBoundary := session.checkpointBoundary
+	session.mu.Unlock()
+	return checkpointBoundary, session.declareFailedWriterGapsLocked(checkpointBoundary)
+}
+
+func (session *captureSession) declareFailedWriterGapsLocked(throughMS int64) error {
+	session.mu.Lock()
+	coverage := make(map[string]int64, len(session.failedWriterCoverage))
+	for trackID, startMS := range session.failedWriterCoverage {
+		coverage[trackID] = startMS
+	}
+	session.mu.Unlock()
+	for trackID, startMS := range coverage {
+		if throughMS <= startMS {
+			continue
+		}
+		if err := session.timeline.DeclareGap(trackID, startMS, throughMS, "source_unavailable"); err != nil {
+			return err
+		}
+		session.mu.Lock()
+		if session.failedWriterCoverage[trackID] == startMS {
+			session.failedWriterCoverage[trackID] = throughMS
+		}
+		session.mu.Unlock()
+	}
+	return nil
 }
 
 func (session *captureSession) closeTrackBarriers(ctx context.Context, trackIDs []string, atMS int64) error {
@@ -1280,7 +1361,10 @@ func (session *captureSession) failAndSeal(cause error) error {
 		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, err)
 	}
 	end := *recovery.TerminalTimelineEnd
-	checkpointBoundary := session.currentCheckpointBoundary()
+	checkpointBoundary, gapErr := session.checkpointBoundaryWithFailedWriterGaps()
+	if gapErr != nil {
+		return errors.Join(ErrCaptureIncomplete, ErrFinalizationFailed, cause, closeErr, gapErr)
+	}
 	if end < checkpointBoundary {
 		return errors.Join(
 			ErrCaptureIncomplete,

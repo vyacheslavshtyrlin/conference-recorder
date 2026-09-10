@@ -88,6 +88,7 @@ export async function executeV2Composition(
             (scene.startMs - segment.startMs - videoSeekLookbackMs) / 1_000,
           )),
         ],
+        true,
       );
       await assertIntermediate(next, options.maximumIntermediateBytes);
       await rm(canvas, { force: true });
@@ -260,6 +261,7 @@ async function runFilterStage(
   filtergraph: string,
   outputArguments: string[],
   inputSeekSeconds?: Array<number | undefined>,
+  loopFirstInput = false,
 ): Promise<void> {
   const bytes = Buffer.byteLength(filtergraph, "utf8");
   if (bytes > maximumFiltergraphBytes)
@@ -271,7 +273,11 @@ async function runFilterStage(
       "-hide_banner", "-loglevel", "error", "-y",
       ...inputs.flatMap((path, index) => {
         const seek = inputSeekSeconds?.[index];
-        return seek && seek > 0 ? ["-ss", seconds(seek), "-i", path] : ["-i", path];
+        return [
+          ...(loopFirstInput && index === 0 ? ["-stream_loop", "-1"] : []),
+          ...(seek && seek > 0 ? ["-ss", seconds(seek)] : []),
+          "-i", path,
+        ];
       }),
       "-filter_complex_script", script,
       ...outputArguments,
