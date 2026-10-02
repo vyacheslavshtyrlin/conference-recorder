@@ -1,5 +1,10 @@
 ﻿name: conference-recording
 
+x-worker-secret-boundary: &worker-secret-boundary
+  DATABASE_URL:
+  RECORDING_S3_ACCESS_KEY_ID:
+  RECORDING_S3_SECRET_ACCESS_KEY:
+
 services:
   recording-capture-1:
     init: true
@@ -8,23 +13,25 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
-      NODE_ENV: production
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
-      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
       RECORDING_BOT_WORKER_ID: recording-worker-1
       RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+      RECORDING_COMPOSITION_SERVICE_SECRET: ""
     ports:
       - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_1:-8091}:8090"
     volumes:
       - recording-capture-1-data:/var/lib/conference-recording
-    shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    cpu_shares: 1024
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-2:
     init: true
@@ -33,23 +40,25 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
-      NODE_ENV: production
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
-      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
       RECORDING_BOT_WORKER_ID: recording-worker-2
       RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+      RECORDING_COMPOSITION_SERVICE_SECRET: ""
     ports:
       - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_2:-8092}:8090"
     volumes:
       - recording-capture-2-data:/var/lib/conference-recording
-    shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    cpu_shares: 1024
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-3:
     init: true
@@ -58,23 +67,25 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
-      NODE_ENV: production
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
-      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
       RECORDING_BOT_WORKER_ID: recording-worker-3
       RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+      RECORDING_COMPOSITION_SERVICE_SECRET: ""
     ports:
       - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_3:-8093}:8090"
     volumes:
       - recording-capture-3-data:/var/lib/conference-recording
-    shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    cpu_shares: 1024
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-4:
     init: true
@@ -83,23 +94,25 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
-      NODE_ENV: production
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
-      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
       RECORDING_BOT_WORKER_ID: recording-worker-4
       RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+      RECORDING_COMPOSITION_SERVICE_SECRET: ""
     ports:
       - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_4:-8094}:8090"
     volumes:
       - recording-capture-4-data:/var/lib/conference-recording
-    shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    cpu_shares: 1024
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-capture-5:
     init: true
@@ -108,23 +121,25 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
-      NODE_ENV: production
+      <<: *worker-secret-boundary
+      RECORDING_RUNTIME_ENV: production
       RECORDING_BOT_BIND_HOST: 0.0.0.0
       RECORDING_BOT_PORT: 8090
-      RECORDING_BOT_PUBLIC_ORIGIN: http://127.0.0.1:8090
       RECORDING_BOT_WORKER_ID: recording-worker-5
       RECORDING_BOT_MAX_SLOTS: ${RECORDING_BOT_MAX_SLOTS:-10}
+      RECORDING_COMPOSITION_SERVICE_SECRET: ""
     ports:
       - "${RECORDING_BOT_BIND_ADDR:-127.0.0.1}:${RECORDING_CAPTURE_PORT_5:-8095}:8090"
     volumes:
       - recording-capture-5-data:/var/lib/conference-recording
-    shm_size: 1gb
     cpus: "${RECORDING_BOT_CPUS:-6.0}"
+    cpu_shares: 1024
     mem_limit: "${RECORDING_BOT_MEMORY_LIMIT:-8g}"
     pids_limit: "${RECORDING_BOT_PIDS_LIMIT:-512}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_STOP_GRACE_PERIOD:-5m20s}
 
   recording-composition:
     init: true
@@ -134,16 +149,27 @@ services:
       dockerfile: Dockerfile
     command: ["node", "dist/composition.js"]
     env_file:
-      - ${RECORDING_ENV_FILE:-.env.example}
+      - ${RECORDING_ENV_FILE:?RECORDING_ENV_FILE is required}
     environment:
+      <<: *worker-secret-boundary
       NODE_ENV: production
+      RECORDING_RUNTIME_ENV: production
+      RECORDING_CAPTURE_SERVICE_SECRET: ""
+      RECORDING_BOT_CONTROL_JWT_HS256_SECRET: ""
     healthcheck:
-      disable: true
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
     volumes:
       - recording-composition-data:/var/lib/conference-recording
     cpus: "${RECORDING_COMPOSITION_CPUS:-2.0}"
+    cpu_shares: 128
     mem_limit: "${RECORDING_COMPOSITION_MEMORY_LIMIT:-4g}"
+    pids_limit: "${RECORDING_COMPOSITION_PIDS_LIMIT:-128}"
     restart: unless-stopped
+    stop_grace_period: ${RECORDING_COMPOSITION_STOP_GRACE_PERIOD:-5m20s}
 
 volumes:
   recording-capture-1-data:

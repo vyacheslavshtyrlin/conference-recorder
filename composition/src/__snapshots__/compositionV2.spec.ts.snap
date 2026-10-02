@@ -1,0 +1,405 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`capture-v2 production staging goldens > renders a partial terminal gap as avatar fallback 1`] = `
+{
+  "scenes": [
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=6,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 6000,
+      "startMs": 0,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=6,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=6,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=6,trim=start=0:duration=6,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];[p0name4]trim=duration=6,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 6000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-a",
+              "uploadId": "upload-a",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=4,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 10000,
+      "startMs": 6000,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=4,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=4,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[p0layer1]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name2];[p0name2]trim=duration=4,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [],
+        },
+      ],
+    },
+  ],
+}
+`;
+
+exports[`capture-v2 production staging goldens > renders camera-only grid with a name overlay 1`] = `
+{
+  "scenes": [
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=10,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 10000,
+      "startMs": 0,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=10,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=10,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=10,trim=start=0:duration=10,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];[p0name4]trim=duration=10,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-camera",
+              "uploadId": "upload-camera",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+}
+`;
+
+exports[`capture-v2 production staging goldens > renders muted camera as initials/name avatar 1`] = `
+{
+  "scenes": [
+    {
+      "audioGroups": [
+        [
+          {
+            "captureGeneration": 1,
+            "codec": "opus",
+            "container": "webm",
+            "contentType": "audio/webm",
+            "endMs": 10000,
+            "expectedBytes": 10,
+            "participantInstanceId": "pi-a",
+            "sequence": 0,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source": "mic",
+            "startMs": 0,
+            "trackId": "trk-mic",
+            "uploadId": "upload-mic",
+          },
+        ],
+      ],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=10,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 10000,
+      "startMs": 0,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=10,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=10,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[p0layer1]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name2];[p0name2]trim=duration=10,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [],
+        },
+      ],
+    },
+  ],
+}
+`;
+
+exports[`capture-v2 production staging goldens > renders screen start stop and replacement with CanvasComposer stage layouts 1`] = `
+{
+  "scenes": [
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=2,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 2000,
+      "startMs": 0,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=2,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=2,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=2,trim=start=0:duration=2,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];color=c=0x172033:s=603x664:r=24:d=2,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='B':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar5];[p0name4][p0avatar5]overlay=x=649:y=28[p0layer6];[2:v]tpad=stop_mode=clone:stop_duration=2,trim=start=0:duration=2,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media7];[p0layer6][p0media7]overlay=x=649:y=28:eof_action=pass[p0layer8];[p0layer8]drawtext=expansion=none:text='Blair':fontcolor=0xf8fafc:fontsize=18:x=671:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name9];[p0name9]trim=duration=2,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-a",
+              "uploadId": "upload-a",
+            },
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-b",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-b",
+              "uploadId": "upload-b",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=3,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 5000,
+      "startMs": 2000,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=3,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=244x244:r=24:d=3,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='B':fontcolor=0x8fb4f8:fontsize=43:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=1008:y=238[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=4,trim=start=1:duration=3,setpts=PTS-STARTPTS,scale=244:244:force_original_aspect_ratio=increase,crop=244:244[p0media2];[p0layer1][p0media2]overlay=x=1008:y=238:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Blair':fontcolor=0xf8fafc:fontsize=18:x=1030:y=446:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];color=c=0x080d16:s=962x664:r=24:d=3[p0screencard5];[p0name4][p0screencard5]overlay=x=28:y=28[p0layer6];[2:v]tpad=stop_mode=clone:stop_duration=3,trim=start=0:duration=3,setpts=PTS-STARTPTS,scale=938:602:force_original_aspect_ratio=decrease,pad=938:602:(ow-iw)/2:(oh-ih)/2[p0media7];[p0layer6][p0media7]overlay=x=40:y=78:eof_action=pass[p0layer8];[p0layer8]drawbox=x=40:y=40:w=938:h=28:c=0x060c16f0:t=fill,drawbox=x=53:y=49:w=10:h=10:c=0x7dd3fc:t=fill,drawtext=expansion=none:text='Screen share · Alex':fontcolor=0xf8fafc:fontsize=17:x=72:y=46[p0screenname9];[p0screenname9]trim=duration=3,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-b",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-b",
+              "uploadId": "upload-b",
+            },
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 5000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "screen",
+              "startMs": 2000,
+              "trackId": "trk-screen-a",
+              "uploadId": "upload-screen-a",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=3,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 8000,
+      "startMs": 5000,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=3,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=244x244:r=24:d=3,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=43:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=1008:y=238[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=4,trim=start=1:duration=3,setpts=PTS-STARTPTS,scale=244:244:force_original_aspect_ratio=increase,crop=244:244[p0media2];[p0layer1][p0media2]overlay=x=1008:y=238:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=1030:y=446:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];color=c=0x080d16:s=962x664:r=24:d=3[p0screencard5];[p0name4][p0screencard5]overlay=x=28:y=28[p0layer6];[2:v]tpad=stop_mode=clone:stop_duration=3,trim=start=0:duration=3,setpts=PTS-STARTPTS,scale=938:602:force_original_aspect_ratio=decrease,pad=938:602:(ow-iw)/2:(oh-ih)/2[p0media7];[p0layer6][p0media7]overlay=x=40:y=78:eof_action=pass[p0layer8];[p0layer8]drawbox=x=40:y=40:w=938:h=28:c=0x060c16f0:t=fill,drawbox=x=53:y=49:w=10:h=10:c=0x7dd3fc:t=fill,drawtext=expansion=none:text='Screen share · Blair':fontcolor=0xf8fafc:fontsize=17:x=72:y=46[p0screenname9];[p0screenname9]trim=duration=3,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-a",
+              "uploadId": "upload-a",
+            },
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 8000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-b",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "screen",
+              "startMs": 5000,
+              "trackId": "trk-screen-b",
+              "uploadId": "upload-screen-b",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=2,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 10000,
+      "startMs": 8000,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=2,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=2,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=3,trim=start=1:duration=2,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];color=c=0x172033:s=603x664:r=24:d=2,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='B':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar5];[p0name4][p0avatar5]overlay=x=649:y=28[p0layer6];[2:v]tpad=stop_mode=clone:stop_duration=3,trim=start=1:duration=2,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media7];[p0layer6][p0media7]overlay=x=649:y=28:eof_action=pass[p0layer8];[p0layer8]drawtext=expansion=none:text='Blair':fontcolor=0xf8fafc:fontsize=18:x=671:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name9];[p0name9]trim=duration=2,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-a",
+              "uploadId": "upload-a",
+            },
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-b",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-b",
+              "uploadId": "upload-b",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+}
+`;
+
+exports[`capture-v2 production staging goldens > splits a long camera source across another participant join and leave 1`] = `
+{
+  "scenes": [
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=3,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 3000,
+      "startMs": 0,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=3,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=3,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=3,trim=start=0:duration=3,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];[p0name4]trim=duration=3,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-z",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-z",
+              "uploadId": "upload-z",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=4,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 7000,
+      "startMs": 3000,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=4,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=4,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=5,trim=start=1:duration=4,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];color=c=0x172033:s=603x664:r=24:d=4,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='B':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar5];[p0name4][p0avatar5]overlay=x=649:y=28[p0layer6];[2:v]tpad=stop_mode=clone:stop_duration=4,trim=start=0:duration=4,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media7];[p0layer6][p0media7]overlay=x=649:y=28:eof_action=pass[p0layer8];[p0layer8]drawtext=expansion=none:text='Blair':fontcolor=0xf8fafc:fontsize=18:x=671:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name9];[p0name9]trim=duration=4,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-z",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-z",
+              "uploadId": "upload-z",
+            },
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 7000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-a",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 3000,
+              "trackId": "trk-a",
+              "uploadId": "upload-a",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      "audioGroups": [],
+      "baseFiltergraph": "color=c=0x090f1c:s=1280x720:r=24:d=3,drawbox=x=0:y=0:w=460:h=720:c=0x17223a80:t=fill,drawbox=x=920:y=0:w=360:h=720:c=0x131b2c80:t=fill,drawgrid=w=64:h=64:t=1:c=0x94a3b80e,format=yuv420p[vout]",
+      "endMs": 10000,
+      "startMs": 7000,
+      "videoPasses": [
+        {
+          "filtergraph": "[0:v]trim=duration=3,setpts=PTS-STARTPTS[canvas];color=c=0x172033:s=603x664:r=24:d=3,drawbox=x=0:y=0:w=iw:h=ih:c=0x243b66:t=fill,drawtext=expansion=none:text='A':fontcolor=0x8fb4f8:fontsize=119:x=(w-text_w)/2:y=(h-text_h)/2[p0avatar0];[canvas][p0avatar0]overlay=x=28:y=28[p0layer1];[1:v]tpad=stop_mode=clone:stop_duration=4,trim=start=1:duration=3,setpts=PTS-STARTPTS,scale=603:664:force_original_aspect_ratio=increase,crop=603:664[p0media2];[p0layer1][p0media2]overlay=x=28:y=28:eof_action=pass[p0layer3];[p0layer3]drawtext=expansion=none:text='Alex':fontcolor=0xf8fafc:fontsize=18:x=50:y=656:box=1:boxborderw=8:boxcolor=0x030812d1[p0name4];[p0name4]trim=duration=3,setpts=PTS-STARTPTS,format=yuv420p[vout]",
+          "sourceSegments": [
+            {
+              "captureGeneration": 1,
+              "codec": "vp8",
+              "container": "webm",
+              "contentType": "video/webm",
+              "endMs": 10000,
+              "expectedBytes": 10,
+              "participantInstanceId": "pi-z",
+              "sequence": 0,
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source": "camera",
+              "startMs": 0,
+              "trackId": "trk-z",
+              "uploadId": "upload-z",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+}
+`;

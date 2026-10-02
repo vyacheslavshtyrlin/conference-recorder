@@ -1,0 +1,37 @@
+{
+  "id": "consumer-vp8",
+  "producerId": "camera-1",
+  "kind": "video",
+  "rtpParameters": {
+    "mid": "1",
+    "codecs": [
+      {
+        "mimeType": "video/VP8",
+        "payloadType": 101,
+        "clockRate": 90000,
+        "parameters": {},
+        "rtcpFeedback": [
+          { "type": "nack", "parameter": "" },
+          { "type": "nack", "parameter": "pli" },
+          { "type": "ccm", "parameter": "fir" },
+          { "type": "transport-cc", "parameter": "" }
+        ]
+      },
+      {
+        "mimeType": "video/rtx",
+        "payloadType": 102,
+        "clockRate": 90000,
+        "parameters": { "apt": 101 },
+        "rtcpFeedback": []
+      }
+    ],
+    "headerExtensions": [
+      { "uri": "urn:ietf:params:rtp-hdrext:sdes:mid", "id": 1, "encrypt": false, "parameters": {} },
+      { "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time", "id": 4, "encrypt": false, "parameters": {} },
+      { "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01", "id": 5, "encrypt": false, "parameters": {} }
+    ],
+    "encodings": [ { "ssrc": 22222222, "rtx": { "ssrc": 22222223 } } ],
+    "rtcp": { "cname": "mediasoup-vp8", "reducedSize": true }
+  },
+  "paused": true
+}

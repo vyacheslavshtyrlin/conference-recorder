@@ -26,8 +26,10 @@ validate:
   script:
     - npm run lint
     - npm run typecheck
-    - npm run test
+    - node scripts/run-go.mjs test -timeout 180s ./...
     - npm run build
+    - docker build -f composition/Dockerfile -t "${IMAGE_NAME}-composition:${CI_COMMIT_SHORT_SHA}" composition
+    - docker compose --env-file .env.example -f docker-compose.yml config --quiet
   rules:
     - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -35,7 +37,7 @@ validate:
 build:
   stage: build
   script:
-    - docker build -f Dockerfile -t "${IMAGE_NAME}:latest" .
+    - docker build -f Dockerfile -t "${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}" -t "${IMAGE_NAME}:latest" .
   rules:
     - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
 
@@ -45,11 +47,23 @@ deploy:
     name: prod
   script:
     - |
-      if [ -n "$DEPLOY_ENV_PROD" ] && [ -f "$DEPLOY_ENV_PROD" ]; then
-        export RECORDING_ENV_FILE="$DEPLOY_ENV_PROD"
+      deploy_env_prod="${DEPLOY_ENV_PROD:-}"
+      if [ -z "$deploy_env_prod" ] || [ ! -f "$deploy_env_prod" ] || [ ! -s "$deploy_env_prod" ]; then
+        echo "DEPLOY_ENV_PROD must be a non-empty GitLab file variable"
+        exit 1
       fi
-    - export ${IMAGE_ENV_VAR}="${IMAGE_NAME}:latest"
-    - docker compose -f docker-compose.yml up -d --no-build --remove-orphans
+      if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(DATABASE_URL|RECORDING_S3_ACCESS_KEY_ID|RECORDING_S3_SECRET_ACCESS_KEY)[[:space:]]*=' "$deploy_env_prod"; then
+        echo "DEPLOY_ENV_PROD contains API-only database or permanent S3 credentials"
+        exit 1
+      fi
+      export RECORDING_ENV_FILE="$deploy_env_prod"
+    - export ${IMAGE_ENV_VAR}="${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
+    - |
+      for service in recording-capture-1 recording-capture-2 recording-capture-3 recording-capture-4 recording-capture-5; do
+        docker compose --env-file "$RECORDING_ENV_FILE" -f docker-compose.yml up -d --no-build --no-deps --wait "$service"
+      done
+      docker compose --env-file "$RECORDING_ENV_FILE" -f docker-compose.yml up -d --no-build --no-deps --wait recording-composition
+      docker compose --env-file "$RECORDING_ENV_FILE" -f docker-compose.yml up -d --no-build --remove-orphans
   rules:
     - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
 

@@ -1,0 +1,34 @@
+{
+  "id": "consumer-h264",
+  "producerId": "screen-1",
+  "kind": "video",
+  "rtpParameters": {
+    "mid": "2",
+    "codecs": [
+      {
+        "mimeType": "video/H264",
+        "payloadType": 103,
+        "clockRate": 90000,
+        "parameters": { "packetization-mode": 1, "level-asymmetry-allowed": 1, "profile-level-id": "42e01f" },
+        "rtcpFeedback": [
+          { "type": "nack", "parameter": "" },
+          { "type": "nack", "parameter": "pli" },
+          { "type": "ccm", "parameter": "fir" }
+        ]
+      },
+      {
+        "mimeType": "video/rtx",
+        "payloadType": 104,
+        "clockRate": 90000,
+        "parameters": { "apt": 103 },
+        "rtcpFeedback": []
+      }
+    ],
+    "headerExtensions": [
+      { "uri": "urn:ietf:params:rtp-hdrext:sdes:mid", "id": 1, "encrypt": false, "parameters": {} }
+    ],
+    "encodings": [ { "ssrc": 33333333, "rtx": { "ssrc": 33333334 } } ],
+    "rtcp": { "cname": "mediasoup-h264", "reducedSize": true }
+  },
+  "paused": true
+}

@@ -1,0 +1,29 @@
+{
+  "name": "@conference/recording-composition",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "lint": "eslint .",
+    "start": "node dist/composition.js",
+    "test": "vitest run --passWithNoTests",
+    "test:container": "vitest run --passWithNoTests --exclude src/packaging.spec.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.31.0",
+    "@ffmpeg-installer/ffmpeg": "1.1.0",
+    "@ffprobe-installer/ffprobe": "2.1.2",
+    "@types/node": "22.15.30",
+    "eslint": "9.31.0",
+    "globals": "16.3.0",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.37.0",
+    "vitest": "4.1.11"
+  }
+}
