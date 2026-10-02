@@ -263,6 +263,13 @@ func TestLifecyclePauseFlushesAtBoundaryAndResumeStartsNextSegment(t *testing.T)
 		now = value
 		nowMu.Unlock()
 	}
+	packetsWritten := make(chan struct{}, 3)
+	session.runner.dependencies.newPacketWriter = func(_, path string, _ *rtp.Packet) (packetWriter, error) {
+		return notifyingPacketWriter{
+			packetCaptureWriter: packetCaptureWriter{path: path, payloads: &[][]byte{}},
+			written:             packetsWritten,
+		}, nil
+	}
 	track := newLifecycleTrack()
 	track.packets <- vp8Packet(1, true)
 	if err := session.startTrack(context.Background(), TrackEvent{
@@ -271,8 +278,7 @@ func TestLifecyclePauseFlushesAtBoundaryAndResumeStartsNextSegment(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	<-track.consumed
-	waitForStagingFile(t, root, recordingID)
+	waitForPacketWrite(t, packetsWritten)
 	setNow(session.startedAt.Add(500 * time.Millisecond))
 	updated := producer
 	updated.DisplayName = "Alex Updated"
@@ -284,8 +290,7 @@ func TestLifecyclePauseFlushesAtBoundaryAndResumeStartsNextSegment(t *testing.T)
 	}
 	setNow(session.startedAt.Add(600 * time.Millisecond))
 	track.packets <- vp8Packet(2, true)
-	<-track.consumed
-	waitForStagingFile(t, root, recordingID)
+	waitForPacketWrite(t, packetsWritten)
 	setNow(session.startedAt.Add(time.Second))
 	if err := session.Event(context.Background(), Event{
 		Type: "bot:producerPaused", RecordingID: recordingID, Revision: 3,
@@ -326,8 +331,7 @@ func TestLifecyclePauseFlushesAtBoundaryAndResumeStartsNextSegment(t *testing.T)
 		t.Fatal(err)
 	}
 	track.packets <- vp8Packet(3, true)
-	<-track.consumed
-	waitForStagingFile(t, root, recordingID)
+	waitForPacketWrite(t, packetsWritten)
 	setNow(session.startedAt.Add(3 * time.Second))
 	if err := session.Event(context.Background(), Event{
 		Type: "bot:producerPaused", RecordingID: recordingID, Revision: 5,
@@ -653,6 +657,18 @@ func waitForStagingFile(t *testing.T, root, recordingID string) {
 	}
 	t.Fatal("track writer did not create staging media")
 }
+
+func waitForPacketWrite(t *testing.T, written <-chan struct{}) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-written:
+	case <-timer.C:
+		t.Fatal("track writer did not finish writing RTP packet")
+	}
+}
+
 func (fixture *controlPlaneFixture) Recover(context.Context, CaptureFence) (RecoveryState, error) {
 	fixture.recoverCalls++
 	if fixture.recordRecoveryCalls {
