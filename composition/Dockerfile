@@ -2,8 +2,11 @@
 
 FROM node:22.15.0-alpine3.21 AS build
 ARG FONT_PACKAGE_VERSION=2.37-r5
+ARG FFMPEG_PACKAGE_VERSION=6.1.2-r1
 WORKDIR /app
-RUN apk add --no-cache "font-dejavu=${FONT_PACKAGE_VERSION}"
+RUN apk add --no-cache \
+        "font-dejavu=${FONT_PACKAGE_VERSION}" \
+        "ffmpeg=${FFMPEG_PACKAGE_VERSION}"
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY Dockerfile docker-entrypoint.sh ./

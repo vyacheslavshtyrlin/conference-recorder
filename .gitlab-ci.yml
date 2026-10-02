@@ -22,11 +22,13 @@ default:
 validate:
   stage: validate
   before_script:
+    - apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
     - npm ci
   script:
     - npm run lint
     - npm run typecheck
-    - npm run test
+    - node scripts/run-go.mjs test -timeout 180s ./...
+    - npm run test:container --workspace @conference/recording-composition
     - npm run build
     - docker compose --env-file .env.example -f docker-compose.yml config --quiet
   rules:

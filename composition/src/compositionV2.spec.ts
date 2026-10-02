@@ -1,4 +1,3 @@
-import ffmpeg from "@ffmpeg-installer/ffmpeg";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -17,6 +16,10 @@ import {
   type ManifestSegment,
   type Source,
 } from "./compositionV2.js";
+
+const ffmpeg = await import("@ffmpeg-installer/ffmpeg")
+  .then((module) => module.default.path)
+  .catch(() => process.env.RECORDING_FFMPEG_PATH ?? "ffmpeg");
 
 const hash = "a".repeat(64);
 const participant = (id: string, displayName = id) => ({
@@ -355,7 +358,7 @@ describe("capture-v2 layout compatibility", () => {
     const leaf = (input: number, label: string) =>
       `[${input}:a]atrim=duration=0.01,asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,aresample=48000,adelay=0|0,apad=whole_len=480,atrim=duration=0.01[${label}]`;
     const graph = `${leaf(0, "a0")};${leaf(1, "a1")};[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0,volume=2[aout]`;
-    const result = spawnSync(ffmpeg.path, [
+    const result = spawnSync(ffmpeg, [
       "-hide_banner", "-loglevel", "error",
       "-f", "lavfi", "-i", "sine=d=0.01",
       "-f", "lavfi", "-i", "sine=d=0.01",

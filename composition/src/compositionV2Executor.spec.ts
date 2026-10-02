@@ -1,5 +1,3 @@
-import ffmpeg from "@ffmpeg-installer/ffmpeg";
-import ffprobe from "@ffprobe-installer/ffprobe";
 import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +12,12 @@ import {
 import { executeV2Composition } from "./compositionV2Executor.js";
 import { ChildProcessRunner, type ProcessRunner } from "./processRunner.js";
 
+const ffmpeg = { path: await import("@ffmpeg-installer/ffmpeg")
+  .then((module) => module.default.path)
+  .catch(() => process.env.RECORDING_FFMPEG_PATH ?? "ffmpeg") };
+const ffprobe = { path: await import("@ffprobe-installer/ffprobe")
+  .then((module) => module.default.path)
+  .catch(() => process.env.RECORDING_FFPROBE_PATH ?? "ffprobe") };
 const hash = "a".repeat(64);
 const directories: string[] = [];
 
