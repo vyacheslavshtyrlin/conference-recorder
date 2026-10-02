@@ -17,7 +17,7 @@ workflow:
 
 default:
   tags:
-    - 176.109.111.184
+    - 10.1.0.14
 
 validate:
   stage: validate
@@ -78,7 +78,7 @@ cleanup:
 setup-nginx-prod:
   stage: setup-nginx
   tags:
-    - 176.109.111.184
+    - 10.1.0.14
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
       when: manual
